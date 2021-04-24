@@ -1,21 +1,29 @@
 from PySide2.QtCore import *
 from PySide2.QtGui import *
-
+from PySide2.QtWidgets import *
 import os
+import shutil
+from tempfile import TemporaryDirectory
 import re
 import json
-from textviewer import *
+from widgets.textviewer import *
 from urllib.parse import urlparse
 import requests
 import threading
 import webbrowser
 import platform
-from dictionarytree import *
-from progressbar import ProgressBar
+from widgets.dictionarytree import DictionaryTree
+from widgets.progressbar import ProgressBar
 from utilities import wraptip, formatdict
 
 class PresetWindow(QDialog):
     logmessage = Signal(str)
+
+    progressStart = Signal()
+    progressShow = Signal()
+    progressMax = Signal(int)
+    progressStep = Signal()
+    progressStop = Signal()
 
     def __init__(self, parent=None):
         super(PresetWindow,self).__init__(parent)
@@ -106,7 +114,6 @@ class PresetWindow(QDialog):
 
         self.presetLayout.addWidget(self.detailName)
 
-
         self.detailDescription = TextViewer()
         self.presetLayout.addWidget(self.detailDescription)
 
@@ -138,6 +145,15 @@ class PresetWindow(QDialog):
         self.detailSpeed = QLabel('')
         self.presetForm.addRow('<b>Speed</b>', self.detailSpeed)
 
+        # Timeout
+        self.detailTimeout = QLabel('')
+        self.presetForm.addRow('<b>Timeout</b>', self.detailTimeout)
+
+        # Max size
+        self.detailMaxsize = QLabel('')
+        self.presetForm.addRow('<b>Maximum size</b>', self.detailMaxsize)
+
+        # Headers
         self.detailHeaders = QLabel('')
         self.presetForm.addRow('<b>Header nodes</b>', self.detailHeaders)
         
@@ -163,7 +179,6 @@ class PresetWindow(QDialog):
 
         #layout.addWidget(buttons,1)
 
-
         buttons.addStretch()
 
         self.reloadButton=QPushButton('Reload')
@@ -176,11 +191,18 @@ class PresetWindow(QDialog):
         self.rejectButton.setToolTip(wraptip("Close the preset dialog."))
         buttons.addWidget(self.rejectButton)
 
+        self.columnsButton=QPushButton('Add Columns')
+        self.columnsButton.setDefault(True)
+        self.columnsButton.clicked.connect(self.addColumns)
+        self.columnsButton.setToolTip(wraptip("Add the columns of the selected preset to the column setup."))
+        buttons.addWidget(self.columnsButton)
+
         self.applyButton=QPushButton('Apply')
         self.applyButton.setDefault(True)
         self.applyButton.clicked.connect(self.applyPreset)
         self.applyButton.setToolTip(wraptip("Load the selected preset."))
         buttons.addWidget(self.applyButton)
+
         layout.addLayout(buttons)
 
         #status bar
@@ -199,13 +221,44 @@ class PresetWindow(QDialog):
         self.folderButton.setText(self.presetFolder)
 
         self.presetsDownloaded = False
-        self.presetSuffix = ['.3_9.json','.3_10.json']
+        self.presetSuffix = ['.3_9.json','.3_10.json','.fp4.json']
         self.lastSelected = None
 
+        # Progress bar (sync with download thread by signals
+        self.progress = ProgressBar("Downloading default presets from GitHub...", self, hidden=True)
+        self.progressStart.connect(self.setProgressStart)
+        self.progressShow.connect(self.setProgressShow)
+        self.progressMax.connect(self.setProgressMax)
+        self.progressStep.connect(self.setProgressStep)
+        self.progressStop.connect(self.setProgressStop)
 #         if getattr(sys, 'frozen', False):
 #             self.defaultPresetFolder = os.path.join(os.path.dirname(sys.executable),'presets')
 #         elif __file__:
 #             self.defaultPresetFolder = os.path.join(os.path.dirname(__file__),'presets')
+
+    # Sycn progress bar with download thread
+    @Slot()
+    def setProgressStart(self):
+        if self.progress is None:
+            self.progress = ProgressBar("Downloading default presets from GitHub...", self, hidden=True)
+
+    def setProgressShow(self):
+        if self.progress is not None:
+            self.progress.setModal(True)
+            self.progress.show()
+        QApplication.processEvents()
+
+    def setProgressMax(self, maximum):
+        if self.progress is not None:
+            self.progress.setMaximum(maximum)
+
+    def setProgressStep(self):
+        if self.progress is not None:
+            self.progress.step()
+
+    def setProgressStop(self):
+        self.progress.close()
+        self.progress = None
 
     def statusBarClicked(self):
         if not os.path.exists(self.presetFolder):
@@ -244,6 +297,8 @@ class PresetWindow(QDialog):
                 self.detailOptions.setHtml(formatdict(data.get('options',[])))
                 self.detailColumns.setText("\r\n".join(data.get('columns', [])))
                 self.detailSpeed.setText(str(data.get('speed','')))
+                self.detailTimeout.setText(str(data.get('timeout', '')))
+                self.detailMaxsize.setText(str(data.get('maxsize', '')))
 
                 #self.applyButton.setText("Apply")
                 self.presetView.show()
@@ -274,8 +329,11 @@ class PresetWindow(QDialog):
         self.show()
         QApplication.processEvents()
 
+        self.progressShow.emit()
+
         self.initPresets()
         self.raise_()
+
 
     def addPresetItem(self,folder,filename,default=False,online=False):
         try:
@@ -373,10 +431,27 @@ class PresetWindow(QDialog):
                 return False
 
             # Progress
-            progress = ProgressBar("Downloading default presets from GitHub...", self) if not silent else None
-            QApplication.processEvents()
+            self.progressStart.emit()
+            if not silent:
+                self.progressShow.emit()
 
+            # Create temporary download folder
+            tmp = TemporaryDirectory(suffix='FacepagerDefaultPresets')
             try:
+                #Download
+                files = requests.get("https://api.github.com/repos/strohne/Facepager/contents/presets").json()
+                files = [f['path'] for f in files if f['path'].endswith(tuple(self.presetSuffix))]
+                self.progressMax.emit(len(files))
+
+                for filename in files:
+                    response = requests.get("https://raw.githubusercontent.com/strohne/Facepager/master/"+filename)
+                    if response.status_code != 200:
+                        raise(f"GitHub is not available (status code {response.status_code})")
+                    with open(os.path.join(tmp.name, os.path.basename(filename)), 'wb') as f:
+                        f.write(response.content)
+
+                    self.progressStep.emit()
+
                 #Create folder
                 if not os.path.exists(self.presetFolderDefault):
                     os.makedirs(self.presetFolderDefault)
@@ -385,18 +460,10 @@ class PresetWindow(QDialog):
                 for filename in os.listdir(self.presetFolderDefault):
                     os.remove(os.path.join(self.presetFolderDefault,filename))
 
-                #Download
-                files = requests.get("https://api.github.com/repos/strohne/Facepager/contents/presets").json()
-                files = [f['path'] for f in files if f['path'].endswith(tuple(self.presetSuffix))]
-                if progress is not None:
-                    progress.setMaximum(len(files))
+                # Move files from tempfolder
+                for filename in os.listdir(tmp.name):
+                    shutil.move(os.path.join(tmp.name,filename), self.presetFolderDefault)
 
-                for filename in files:
-                    response = requests.get("https://raw.githubusercontent.com/strohne/Facepager/master/"+filename)
-                    with open(os.path.join(self.presetFolderDefault, os.path.basename(filename)), 'wb') as f:
-                        f.write(response.content)
-                    if progress is not None:
-                        progress.step()
                 self.logmessage.emit("Default presets downloaded from GitHub.")
             except Exception as e:
                 if not silent:
@@ -407,8 +474,8 @@ class PresetWindow(QDialog):
                 self.presetsDownloaded = True
                 return True
             finally:
-                if progress is not None:
-                    progress.close()
+                tmp.cleanup()
+                self.progressStop.emit()
 
     def reloadPresets(self):
         self.presetsDownloaded = False
@@ -453,8 +520,6 @@ class PresetWindow(QDialog):
         self.applyButton.setDefault(True)
         self.loadingIndicator.hide()
 
-        #self.currentChanged()
-
     def getCategories(self):
         categories = []
 
@@ -493,7 +558,7 @@ class PresetWindow(QDialog):
             pipeline.append(preset)
 
         # Process pipeline
-        return self.mainWindow.actions.queryPipeline(pipeline)
+        return self.mainWindow.apiActions.queryPipeline(pipeline)
         #self.close()
 
 
@@ -505,25 +570,19 @@ class PresetWindow(QDialog):
         if data.get('iscategory',False):
             return False
             #self.startPipeline()
-
-        #Find API module
-        module = data.get('module', '')
-        module = 'Generic' if module == 'Files' else module
-
-        tab = self.mainWindow.getModule(module)
-        if tab is not None:
-            tab.setOptions(data.get('options', {}))
-            self.mainWindow.RequestTabs.setCurrentWidget(tab)
-
-        #Set columns
-        self.mainWindow.fieldList.setPlainText("\n".join(data.get('columns',[])))
-        self.mainWindow.actions.showColumns()
-
-        #Set global settings
-        self.mainWindow.speedEdit.setValue(data.get('speed',200))
-        self.mainWindow.headersCheckbox.setChecked(data.get('headers',False))
+        else:
+            self.mainWindow.apiActions.applySettings(data)
 
         self.close()
+
+    def addColumns(self):
+        if not self.presetList.currentItem():
+            return False
+
+        data = self.presetList.currentItem().data(0,Qt.UserRole)
+        if not data.get('iscategory',False):
+            self.mainWindow.apiActions.addColumns(data)
+
 
     def uniqueFilename(self,name):
         filename = re.sub('[^a-zA-Z0-9_-]+', '_', name )+self.presetSuffix[-1]
@@ -614,14 +673,7 @@ class PresetWindow(QDialog):
                     'description':description.toPlainText()
             }
 
-            data_settings = {
-                    'module':self.mainWindow.RequestTabs.currentWidget().name,
-                    'options':self.mainWindow.RequestTabs.currentWidget().getOptions('preset'),
-                    'columns': self.mainWindow.fieldList.toPlainText().splitlines(),
-                    'speed':self.mainWindow.speedEdit.value(),
-                    'headers':self.mainWindow.headersCheckbox.isChecked()
-            }
-
+            data_settings = self.mainWindow.apiActions.getPresetOptions()
             self.currentData.update(data_meta)
 
             if self.currentFilename is None:
@@ -637,7 +689,7 @@ class PresetWindow(QDialog):
                     self.currentData.update(data_settings)
 
             # Sanitize and reorder
-            keys = ['name', 'category', 'description', 'module', 'options', 'speed', 'headers','columns']
+            keys = ['name', 'category', 'description', 'module', 'options', 'speed', 'saveheaders','timeout','maxsize','columns']
             self.currentData = {k: self.currentData.get(k, None) for k in keys}
 
             # Create folder

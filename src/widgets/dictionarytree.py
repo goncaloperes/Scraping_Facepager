@@ -10,10 +10,7 @@ import sys
 class DictionaryTree(QTreeView):
     def __init__(self, parent=None, apiWindow = None):
         super(DictionaryTree, self).__init__(parent)
-        #self.setSortingEnabled(True)
-        #self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSelectionBehavior(QTreeView.SelectRows)
-        #self.setHeaderHidden(True)
         self.setUniformRowHeights(True)
 
         delegate = DictionaryTreeItemDelegate()
@@ -21,6 +18,7 @@ class DictionaryTree(QTreeView):
 
         self.treemodel = DictionaryTreeModel(self,apiWindow)
         self.setModel(self.treemodel)
+        self.setColumnWidth(0, 200)
 
         # enable righklick-context menu
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -154,9 +152,9 @@ class DictionaryTreeModel(QAbstractItemModel):
         if index.column() == 0:
             return item.itemDataKey
         elif index.column() == 1:
-            value = item.itemDataValue
-            if isinstance(value, str):
-                value = value.replace('\n', ' ').replace('\r', '')
+            value = item.itemDataShortValue \
+                if item.itemDataShortValue is not None \
+                else item.itemDataValue
 
             return value
 
@@ -211,6 +209,7 @@ class DictionaryTreeItem(object):
         self.itemDataKey = key
         self.itemDataValue = value
         self.itemDataType = 'atom'
+        self.itemDataShortValue = None
 
         self.itemToolTip = wraptip(self.model.getDoc(self.keyPath()))
 
@@ -242,7 +241,15 @@ class DictionaryTreeItem(object):
             self.itemDataValue = value
 
             try:
-                self.itemToolTip = self.itemToolTip + "<p>"+str(wraptip(self.itemDataValue))+"</p>"
+                self.itemDataShortValue = str(self.itemDataValue)
+                self.itemDataShortValue = self.itemDataShortValue.replace('\n', ' ').replace('\r', '')
+                self.itemDataShortValue = (self.itemDataShortValue[:2000] + '...')\
+                    if len(self.itemDataShortValue) > 2000 else self.itemDataShortValue
+            except:
+                self.itemDataShortValue = ""
+
+            try:
+                self.itemToolTip = self.itemToolTip + "<p>"+str(wraptip(self.itemDataShortValue))+"</p>"
             except:
                 pass
 

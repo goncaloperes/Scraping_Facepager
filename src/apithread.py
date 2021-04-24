@@ -3,6 +3,7 @@ import collections
 import threading
 import time
 from copy import deepcopy
+from utilities import *
 
 class ApiThreadPool():
     def __init__(self, module):
@@ -112,10 +113,10 @@ class ApiThreadPool():
     def retryJobs(self):
         while not self.errors.empty():
             newjob = self.errors.get()
-            if newjob['options'].get('ratelimit', False):
-                newjob['number'] = self.jobcount
-                self.jobcount += 1
-                self.input.appendleft(newjob)
+            #if newjob['options'].get('ratelimit', False):
+            newjob['number'] = self.jobcount
+            self.jobcount += 1
+            self.input.appendleft(newjob)
 
         self.resumeJobs()
 
@@ -123,8 +124,11 @@ class ApiThreadPool():
         with self.errors.mutex:
             self.errors.queue.clear()
 
-    def getRetryCount(self):
+    def getErrorJobsCount(self):
         return self.errors.qsize()
+
+    def hasErrorJobs(self):
+        return not self.errors.empty()
 
     # Threads
     def addThread(self):
@@ -190,7 +194,8 @@ class ApiThread(threading.Thread):
 
     def run(self):
         def logData(data, options, headers):
-            out = {'nodeindex': job['nodeindex'], 'nodedata' : job['nodedata'], 'data': data, 'options': options, 'headers': headers}
+            data = sliceData(data, headers, options)
+            out = {'nodeindex': job['nodeindex'], 'nodedata' : job['nodedata'], 'data': data, 'options': options}
             self.output.put(out)
 
         def logMessage(msg):

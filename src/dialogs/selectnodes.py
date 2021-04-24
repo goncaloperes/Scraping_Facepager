@@ -20,7 +20,7 @@ class SelectNodesWindow(QDialog):
         self.running = False
 
         #layout
-        layout = QVBoxLayout(self)        
+        layout = QVBoxLayout()
         central = QHBoxLayout()
         layout.addLayout(central, 1)
         self.setLayout(layout)
@@ -103,8 +103,6 @@ class SelectNodesWindow(QDialog):
                 self.progressUpdate = datetime.now() + timedelta(milliseconds=50)
 
             QApplication.processEvents()
-
-
 
         return not self.canceled
 

@@ -1,6 +1,7 @@
 import urllib.parse
-import urllib.request, urllib.parse, urllib.error
+import urllib.request, urllib.error
 
+import secrets
 import hashlib, hmac, base64
 from mimetypes import guess_all_extensions
 from datetime import datetime
@@ -11,16 +12,17 @@ import io
 from collections import OrderedDict
 import threading
 
-from PySide2.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
-from PySide2.QtNetwork import QNetworkCookie
-from PySide2.QtWidgets import *
-from PySide2.QtCore import QUrl
+from PySide2.QtWebEngineWidgets import QWebEngineView
+from PySide2.QtCore import Qt, QUrl
 
 import requests
 from requests.exceptions import *
 from rauth import OAuth1Service
 from requests_oauthlib import OAuth2Session
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
+from urllib.parse import urlparse, parse_qs, unquote
+
+import webbrowser
 import cchardet
 import json
 
@@ -31,8 +33,10 @@ else:
 
 import dateutil.parser
 
-from folder import SelectFolderDialog
-from paramedit import *
+from dialogs.folder import SelectFolderDialog
+from dialogs.webdialog import PreLoginWebDialog, BrowserDialog, WebPageCustom
+from server import LoginServer
+from widgets.paramedit import *
 from utilities import *
 
 try:
@@ -54,7 +58,9 @@ class ApiTab(QScrollArea):
     def __init__(self, mainWindow=None, name="NoName"):
         QScrollArea.__init__(self, mainWindow)
         self.timeout = None
+        self.maxsize = 5
         self.mainWindow = mainWindow
+        self.loginWindow = None
         self.name = name
         self.connected = False
         self.lastrequest = None
@@ -101,6 +107,14 @@ class ApiTab(QScrollArea):
         except NameError:
             self.defaults = {}
 
+        # Authorization / use preregistered app
+        self.auth_userauthorized = True
+        self.auth_preregistered = self.defaults.get('termsurl', '') != ''
+
+    # Called when Facepager stops
+    def cleanup(self):
+        pass
+
     def idtostr(self, val):
         """
          Return the Node-ID as a string
@@ -122,6 +136,8 @@ class ApiTab(QScrollArea):
     def parsePlaceholders(self,pattern,nodedata,paramdata={},options = {}):
         if not pattern:
             return pattern
+        elif isinstance(pattern,list):
+            return [self.parsePlaceholders(x, nodedata, paramdata, options) for x in pattern]
         else:
             pattern = str(pattern)
 
@@ -186,12 +202,28 @@ class ApiTab(QScrollArea):
             if not match:
                 # Replace placeholders in parameter value
                 value = self.parsePlaceholders(params[name], nodedata, templateparams, options)
-                urlparams[name] = str(value)
+                if isinstance(value,list):
+                    urlparams[name] = [str(x) for x in value]
+                else:
+                    urlparams[name] = str(value)
 
         # Replace placeholders in urlpath
         urlpath = self.parsePlaceholders(urlpath, nodedata, templateparams)
 
         return urlpath, urlparams, templateparams
+
+    def getLogURL(self, urlpath, urlparams, options, removesecrets=True):
+        url = urlpath
+
+        # Convert to list of tuple to allow duplicated keys
+        if urlparams:
+            urltuples = dictToTuples(urlparams)
+            urltuples = urllib.parse.urlencode(urltuples)
+            if removesecrets:
+                urltuples = urltuples.replace(options.get('access_token', ''), '')
+            url += "?" + urltuples
+
+        return url
 
     def getPayload(self,payload, params, nodedata,options, logProgress=None):
         #Return nothing
@@ -241,6 +273,7 @@ class ApiTab(QScrollArea):
             return payload
 
     def getFromDoc(self, dockey, defaultkey = None):
+        dockey = dockey.replace("<", "{").replace(">", "}")
         value = getDictValue(self.apidoc, dockey, dump=False, default=None)
         if (value is None) and (defaultkey is not None):
             value = self.defaults.get(defaultkey)
@@ -260,6 +293,11 @@ class ApiTab(QScrollArea):
         except AttributeError:
             pass
 
+        # Extension (for Twitter, deprecated)
+        options['extension'] = self.defaults.get('extension', '')
+        if (options['extension'] != '') and options['resource'].endswith(options['extension']):
+            options['extension'] = ''
+
         #headers and verbs
         try:
             options['headers'] = self.headerEdit.getParams()
@@ -268,9 +306,12 @@ class ApiTab(QScrollArea):
             pass
 
         # Get doc key for lookup of data handling keys
-        doc_path = 'paths.' + options.get('resource', '') + '.get'
-        doc_response = doc_path +'.responses.200.content.application/json.schema.'
+        doc_resource = options.get('resource', '').strip()
+        if doc_resource == '':
+            doc_resource = '0'
 
+        doc_path = 'paths.' + doc_resource + '.get'
+        doc_response = doc_path +'.responses.200.content.application/json.schema.'
 
         #format
         try:
@@ -353,7 +394,7 @@ class ApiTab(QScrollArea):
             pass
 
 
-                # Options not saved to preset but to settings
+        # Options not saved to preset but to settings
         if purpose != 'preset':
             # query type
             options['querytype'] = self.name + ':' + self.resourceEdit.currentText()            
@@ -388,17 +429,7 @@ class ApiTab(QScrollArea):
             try:
                 options['client_secret'] = self.clientSecretEdit.text()
             except AttributeError:
-                pass       
-            
-            try:
-                options['consumer_key'] = self.consumerKeyEdit.text()
-            except AttributeError:
-                pass            
-
-            try:
-                options['consumer_secret'] = self.consumerSecretEdit.text()
-            except AttributeError:
-                pass            
+                pass
 
         return options
 
@@ -501,10 +532,7 @@ class ApiTab(QScrollArea):
                 self.clientIdEdit.setText(options.get('client_id',''))
             if 'client_secret' in options:
                 self.clientSecretEdit.setText(options.get('client_secret',''))
-            if 'consumer_key' in options:
-                self.consumerKeyEdit.setText(options.get('consumer_key', ''))
-            if 'consumer_secret' in options:
-                self.consumerSecretEdit.setText(options.get('consumer_secret', ''))                                
+
         except AttributeError:
             pass
 
@@ -546,7 +574,7 @@ class ApiTab(QScrollArea):
         if self.apidoc and isinstance(self.apidoc,dict):
             # Add base path
             self.basepathEdit.clear()
-            self.basepathEdit.addItem(getDictValue(self.apidoc,"servers.url"))
+            self.basepathEdit.addItem(getDictValue(self.apidoc,"servers.0.url"))
 
             # Add endpoints in reverse order
             endpoints = self.apidoc.get("paths",{})
@@ -563,6 +591,9 @@ class ApiTab(QScrollArea):
                 self.resourceEdit.setItemData(idx, operations, Qt.UserRole)
 
             self.buttonApiHelp.setVisible(True)
+
+            # Path extension for Twitter (deprecated)
+            self.defaults['extension'] = getDictValue(self.apidoc, "servers.0.x-facepager-suffix")
 
             # Default extract settings
             self.defaults['key_objectid'] = getDictValueOrNone(self.apidoc,"x-facepager-objectid")
@@ -709,9 +740,15 @@ class ApiTab(QScrollArea):
 
     def pagingChanged(self):
         if self.pagingTypeEdit.currentText() == "count":
+            self.pagingParamWidget.show()
             self.pagingStepsWidget.show()
             self.pagingKeyWidget.hide()
+        elif self.pagingTypeEdit.currentText() == "url":
+            self.pagingParamWidget.hide()
+            self.pagingStepsWidget.hide()
+            self.pagingKeyWidget.show()
         else:
+            self.pagingParamWidget.show()
             self.pagingStepsWidget.hide()
             self.pagingKeyWidget.show()
 
@@ -719,30 +756,38 @@ class ApiTab(QScrollArea):
             self.pagingTypeEdit.hide()
 
 
-    def initPagingInputs(self,keys = False, count = False):
+    def initPagingInputs(self,keys = False):
         layout= QHBoxLayout()
         
-        if keys or count:
+        if keys:
             # Paging type
 
             self.pagingTypeEdit = QComboBox(self)
 
-            if keys:
-                self.pagingTypeEdit.addItem('key')
-            if count:
-                self.pagingTypeEdit.addItem('count')
+            self.pagingTypeEdit.addItem('key')
+            self.pagingTypeEdit.addItem('count')
+            self.pagingTypeEdit.addItem('url')
 
-            self.pagingTypeEdit.setToolTip(wraptip("Select 'key' if the response contains data about the next page, e.g. page number or offset. Select 'count' if you want to increase the paging param by a fixed amount."))
+            self.pagingTypeEdit.setToolTip(wraptip("Select 'key' if the response contains data about the next page, e.g. page number or offset. Select 'count' if you want to increase the paging param by a fixed amount. Select 'url' if the response contains a complete URL to the next page."))
             self.pagingTypeEdit.currentIndexChanged.connect(self.pagingChanged)
             layout.addWidget(self.pagingTypeEdit)
             layout.setStretch(0, 0)
 
-            layout.addWidget(QLabel("Param"))
+            # Paging param
+            self.pagingParamWidget = QWidget()
+            self.pagingParamLayout = QHBoxLayout()
+            self.pagingParamLayout .setContentsMargins(0, 0, 0, 0)
+            self.pagingParamWidget.setLayout(self.pagingParamLayout)
+
+            self.pagingParamLayout.addWidget(QLabel("Param"))
             self.pagingparamEdit = QLineEdit(self)
-            self.pagingparamEdit.setToolTip(wraptip("This parameter will be added to the query. The value is extracted by the paging key."))
-            layout.addWidget(self.pagingparamEdit)
-            layout.setStretch(1, 0)
-            layout.setStretch(2, 1)
+            self.pagingparamEdit.setToolTip(wraptip("This parameter will be added to the query if you select key-pagination. The value is extracted by the paging key."))
+            self.pagingParamLayout.addWidget(self.pagingparamEdit)
+            self.pagingParamLayout.setStretch(0,0)
+            self.pagingParamLayout.setStretch(1, 0)
+
+            layout.addWidget(self.pagingParamWidget)
+            layout.setStretch(1, 2)
 
             # Paging key
             self.pagingKeyWidget = QWidget()
@@ -752,13 +797,13 @@ class ApiTab(QScrollArea):
 
             self.pagingKeyLayout.addWidget(QLabel("Paging key"))
             self.pagingkeyEdit = QLineEdit(self)
-            self.pagingkeyEdit.setToolTip(wraptip("If the respsonse contains data about the next page, specify the key. The value will be added as paging parameter."))
+            self.pagingkeyEdit.setToolTip(wraptip("If the respsonse contains data about the next page, specify the key. The value will be added as paging parameter or used as the URL."))
             self.pagingKeyLayout.addWidget(self.pagingkeyEdit)
             self.pagingKeyLayout.setStretch(0, 0)
             self.pagingKeyLayout.setStretch(1, 1)
 
             layout.addWidget(self.pagingKeyWidget)
-            layout.setStretch(3, 2)
+            layout.setStretch(2, 2)
 
             # Page steps
             self.pagingStepsWidget = QWidget()
@@ -776,6 +821,7 @@ class ApiTab(QScrollArea):
 
             self.pagingStepsLayout.addWidget(QLabel("Step"))
             self.offsetStepEdit = QSpinBox(self)
+            self.offsetStepEdit.setMaximum(10000)
             self.offsetStepEdit.setValue(1)
             self.offsetStepEdit.setToolTip(wraptip("Amount to increase for each page, defaults to 1"))
             self.pagingStepsLayout.addWidget(self.offsetStepEdit)
@@ -783,15 +829,15 @@ class ApiTab(QScrollArea):
             self.pagingStepsLayout.setStretch(3, 1)
 
             layout.addWidget(self.pagingStepsWidget)
-            layout.setStretch(4, 1)
+            layout.setStretch(3, 1)
 
             # Stop if
             layout.addWidget(QLabel("Stop key"))
             self.pagingstopEdit = QLineEdit(self)
             self.pagingstopEdit.setToolTip(wraptip("Stops fetching data as soon as the given key is present but empty or false. For example, stops fetching if the value of 'hasNext' ist false, none or an empty list. Usually you can leave the field blank, since fetching will stop anyway when the paging key is empty."))
             layout.addWidget(self.pagingstopEdit)
-            layout.setStretch(5, 0)
-            layout.setStretch(6, 1)
+            layout.setStretch(4, 0)
+            layout.setStretch(5, 1)
 
             #Page count
             layout.addWidget(QLabel("Maximum pages"))
@@ -800,8 +846,8 @@ class ApiTab(QScrollArea):
             self.pagesEdit.setMaximum(50000)
             self.pagesEdit.setToolTip(wraptip("Number of maximum pages."))
             layout.addWidget(self.pagesEdit)
+            layout.setStretch(6, 0)
             layout.setStretch(7, 0)
-            layout.setStretch(8, 0)
 
             rowcaption = "Paging"
 
@@ -824,7 +870,7 @@ class ApiTab(QScrollArea):
     def initVerbInputs(self):
         # Verb and encoding
         self.verbEdit = QComboBox(self)
-        self.verbEdit.addItems(['GET','POST','PUT','PATCH','DELETE'])
+        self.verbEdit.addItems(['GET','HEAD','POST','PUT','PATCH','DELETE'])
         self.verbEdit.currentIndexChanged.connect(self.verbChanged)
 
         self.encodingLabel = QLabel("Encoding")
@@ -835,10 +881,10 @@ class ApiTab(QScrollArea):
 
         layout= QHBoxLayout()
         layout.addWidget(self.verbEdit)
-        layout.setStretch(0, 1);
+        layout.setStretch(0, 1)
         layout.addWidget(self.encodingLabel)
         layout.addWidget(self.encodingEdit)
-        layout.setStretch(2, 1);
+        layout.setStretch(2, 1)
         self.mainLayout.addRow("Method", layout)
         
         # Payload
@@ -860,7 +906,7 @@ class ApiTab(QScrollArea):
         self.mainLayout.addRow("Payload", self.payloadWidget)
 
     def verbChanged(self):
-        if self.verbEdit.currentText() in ['GET','DELETE']:
+        if self.verbEdit.currentText() in ['GET','DELETE','HEAD']:
             self.payloadWidget.hide()
             self.mainLayout.labelForField(self.payloadWidget).hide()
             
@@ -891,21 +937,54 @@ class ApiTab(QScrollArea):
             self.folderwidget.show()
             self.mainLayout.labelForField(self.folderwidget).show()                        
 
-    def initResponseInputs(self):
+    def initResponseInputs(self, format=False):
         layout= QHBoxLayout()
-        
-        #Extract
-        self.extractEdit = QLineEdit(self)
-        layout.addWidget(self.extractEdit)
-        layout.setStretch(0, 1)
 
-        layout.addWidget(QLabel("Key for Object ID"))
-        self.objectidEdit = QLineEdit(self)
-        layout.addWidget(self.objectidEdit)
-        layout.setStretch(2, 1)
-                    
-        #Add layout                
-        self.extraLayout.addRow("Key to extract", layout)
+        if not format:
+            #Extract
+            self.extractEdit = QLineEdit(self)
+            layout.addWidget(self.extractEdit)
+            layout.setStretch(0, 1)
+
+            layout.addWidget(QLabel("Key for Object ID"))
+            self.objectidEdit = QLineEdit(self)
+            layout.addWidget(self.objectidEdit)
+            layout.setStretch(2, 1)
+
+            #Add layout
+            self.extraLayout.addRow("Key to extract", layout)
+        else:
+            # Format
+            self.formatEdit = QComboBox(self)
+            self.formatEdit.addItems(['json', 'text', 'links','xml','file'])
+            self.formatEdit.setToolTip("<p>JSON: default option, data will be parsed as JSON. </p> \
+                                        <p>Text: data will not be parsed and embedded in JSON. </p> \
+                                        <p>Links: data will be parsed as xml and links will be extracted (set key to extract to 'links' and key for Object ID to 'url'). </p> \
+                                        <p>XML: data will be parsed as XML and converted to JSON. </p> \
+                                        <p>File: data will only be downloaded to files, specify download folder and filename.</p>")
+            layout.addWidget(self.formatEdit)
+            layout.setStretch(0, 0)
+            # self.formatEdit.currentIndexChanged.connect(self.formatChanged)
+
+            # Extract
+            layout.addWidget(QLabel("Key to extract"))
+            self.extractEdit = QLineEdit(self)
+            self.extractEdit.setToolTip(wraptip(
+                "If your data contains a list of objects, set the key of the list. Every list element will be adeded as a single node. Remaining data will be added as offcut node."))
+            layout.addWidget(self.extractEdit)
+            layout.setStretch(1, 0)
+            layout.setStretch(2, 2)
+
+            layout.addWidget(QLabel("Key for Object ID"))
+            self.objectidEdit = QLineEdit(self)
+            self.objectidEdit.setToolTip(
+                wraptip("If your data contains unique IDs for every node, define the corresponding key."))
+            layout.addWidget(self.objectidEdit)
+            layout.setStretch(3, 0)
+            layout.setStretch(4, 2)
+
+            # Add layout
+            self.extraLayout.addRow("Response", layout)
 
     @Slot()
     def onChangedRelation(self, index = None):
@@ -965,457 +1044,14 @@ class ApiTab(QScrollArea):
         #
         # return proxy
 
-    def initSession(self, no=0, renew=False):
-        """
-        Return existing session or create a new session if necessary
-        :param no: Session number
-        :return: session
-        """
-        with self.lock_session:
-            while (len(self.sessions) <= no):
-                self.sessions.append(None)
-
-            session = self.sessions[no] if not renew else None
-
-            if session is None:
-                session = requests.Session()
-                session.proxies.update(self.getProxies())
-
-                # Mount new adapters = don't cache connections
-                adapter = requests.adapters.HTTPAdapter()
-                session.mount('http://', adapter)
-                session.mount('https://', adapter)
-                session.mount('file://', LocalFileAdapter())
-
-            self.sessions[no] = session
-
-        return session
-
-    def closeSession(self, no=0):
-        """
-        Close the session
-        :param no: number of session
-        :return: None
-        """
-        with self.lock_session:
-            if (len(self.sessions) > no) and (self.sessions[no] is not None):
-                self.sessions[no].close()
-                self.sessions[no] = None
-
-    def request(self, session_no=0, path=None, args=None, headers=None, method="GET", payload=None,foldername=None,
-                                                      filename=None, fileext=None, format='json'):
-        """
-        Start a new threadsafe session and request
-        """
-
-        def download(response,foldername=None,filename=None,fileext=None):
-            if foldername is not None and filename is not None:
-                if fileext is None:
-                    guessed_ext = guess_all_extensions(response.headers["content-type"])
-                    fileext = guessed_ext[-1] if len(guessed_ext) > 0 else None
-
-                fullfilename = makefilename(path,foldername, filename, fileext)
-                file = open(fullfilename, 'wb')
-            else:
-                fullfilename = None
-                file = None
-
-            # requests completely downloads data to memory if not stream=True
-            # iter_content, text and content all fall back to the previously downloaded content
-            # no need to download into string object a second time
-
-            # try:
-            #     content = io.BytesIO()
-            #     try:
-            #         for chunk in response.iter_content(1024):
-            #             content.write(chunk)
-            #             if file is not None:
-            #                 file.write(chunk)
-            #
-            #         out = content.getvalue().decode('utf-8')
-            #     except Exception as e:
-            #         out = str(e)
-            #     finally:
-            #         content.close()
-            # finally:
-            #     if file is not None:
-            #         file.close()
-
-            if file is not None:
-                try:
-                    for chunk in response.iter_content(1024):
-                        file.write(chunk)
-                finally:
-                    file.close()
-
-
-            return fullfilename
-
-        #Throttle speed
-        if (self.speed is not None) and (self.lastrequest is not None):
-            pause = ((60 * 1000) / float(self.speed)) - self.lastrequest.msecsTo(QDateTime.currentDateTime())
-            while (self.connected) and (pause > 0):
-                time.sleep(0.1)
-                pause = ((60 * 1000) / float(self.speed)) - self.lastrequest.msecsTo(QDateTime.currentDateTime())
-
-        self.lastrequest = QDateTime.currentDateTime()
-
-        session = self.initSession(session_no)
-
-        try:
-            maxretries = 3
-            while True:
-                try:
-                    if (not session):
-                        raise Exception("No session available.")
-
-                    response = session.request(method,path, params=args,headers=headers,data=payload, timeout=self.timeout) # verify=False
-
-                except (HTTPError, ConnectionError) as e:
-                    maxretries -= 1
-
-                    # Try next request with new session
-                    if maxretries > 0:
-                        time.sleep(0.1)
-                        session = self.initSession(session_no, True)
-                        self.logMessage("Automatic retry: Request Error: {0}".format(str(e)))
-                    else:
-                        raise e
-                else:
-                    break
-
-        except (HTTPError, ConnectionError, InvalidURL, MissingSchema) as e:
-            status = 'request error'
-            data = {'error':str(e)}
-            headers = {}
-            return data, headers, status
-            #raise Exception("Request Error: {0}".format(str(e)))
-
-        else:
-            status = 'fetched' if response.ok else 'error'
-            status = status + ' (' + str(response.status_code) + ')'
-            headers = dict(list(response.headers.items()))
-
-            # Download data
-            data = {
-                'content-type': response.headers.get("content-type",""),
-                'sourcepath': path,'sourcequery': args,'finalurl': response.url
-            }
-
-            fullfilename = download(response, foldername, filename, fileext)
-
-            if fullfilename is not None:
-                data['filename'] = os.path.basename(fullfilename)
-                data['filepath'] = fullfilename
-
-            # Text
-            if format == 'text':
-                    data['text'] = response.text  # str(response.text)
-
-             # Scrape links
-            elif format == 'links':
-                try:
-                    links, base = extractLinks(response.text, response.url)
-                    data['links'] = links
-                    data['base'] = base
-                except Exception as  e:
-                    data['error'] = 'Could not extract Links.'
-                    data['message'] = str(e)
-                    data['response'] = response.text
-
-            # JSON
-            elif format == 'json':
-                try:
-                    data = response.json() if response.text != '' else []
-                except Exception as e:
-                    # self.logMessage("No valid JSON data, try to convert XML to JSON ("+str(e)+")")
-                    # try:
-                    #     data = xmlToJson(response.text)
-                    # except:
-                    data = {'error': 'Data could not be converted to JSON','response': response.text}
-
-            # JSON
-            elif format == 'xml':
-                try:
-                    data = xmlToJson(response.text)
-                except:
-                    data = {'error': 'Data could not be converted to JSON','response': response.text}
-
-            return data, headers, status
-
-    def disconnectSocket(self):
-        """Used to disconnect when canceling requests"""
-        self.connected = False
-
-    @Slot()
-    def editAuthSettings(self):
-        dialog = QDialog(self,Qt.WindowSystemMenuHint | Qt.WindowTitleHint)
-        dialog.setWindowTitle("Authentication settings")
-        dialog.setMinimumWidth(400)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.authWidget)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
-        layout.addWidget(buttons)
-        dialog.setLayout(layout)
-
-        def close():
-            dialog.close()
-
-        #connect the nested functions above to the dialog-buttons
-        buttons.accepted.connect(close)
-        dialog.exec_()
-
-    @Slot()
-    def showLoginWindow(self, caption='', url='',width=600,height=600):
-        """
-        Create a SSL-capable WebView for the login-process
-        Uses a Custom QT-Webpage Implementation
-        Supply a getToken-Slot to fetch the API-Token
-        """
-
-        self.loginWindow = QMainWindow(self.mainWindow)
-        self.loginWindow.resize(width, height)
-        self.loginWindow.setWindowTitle(caption)
-        self.loginWindow.stopped = False
-        self.loginWindow.cookie = ''
-
-
-        #create WebView with Facebook log-Dialog, OpenSSL needed
-        self.loginStatus = self.loginWindow.statusBar()
-        self.login_webview = QWebEngineView(self.loginWindow)
-        self.loginWindow.setCentralWidget(self.login_webview)
-
-        # Use the custom- WebPage class
-        webpage = QWebPageCustom(self)
-        webpage.logmessage.connect(self.logMessage)
-        self.login_webview.setPage(webpage)
-
-        #Connect to the getToken-method
-        self.login_webview.urlChanged.connect(self.getToken)
-        webpage.urlNotFound.connect(self.getToken) #catch redirects to localhost or nonexistent uris
-
-        # Connect to the loadFinished-Slot for an error message
-        self.login_webview.loadFinished.connect(self.loadFinished)
-
-        # Connect the cookieChanged-Slot to get cookies
-        webpage.cookieChanged.connect(self.cookieChanged)
-
-        self.login_webview.load(QUrl(url))
-        #self.login_webview.resize(window.size())
-        self.login_webview.show()
-
-        self.loginWindow.show()
-
-    @Slot()
-    def closeLoginWindow(self):
-        self.loginWindow.stopped = True
-        self.login_webview.stop()
-        self.loginWindow.close()
-
-    @Slot()
-    def loadFinished(self, success):
-        if (not success and not self.loginWindow.stopped):
-            self.logMessage('Error loading web page')
-
-    @Slot()
-    def cookieChanged(self, domain, cookie):
-        if hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Cookie':
-            try:
-                options = self.getOptions()
-                targeturl= options.get('auth_uri', '')
-                targeturl= urllib.parse.urlparse(targeturl)
-                targetdomain = targeturl.netloc
-            except:
-                targetdomain = None
-
-            if domain == targetdomain:
-                self.tokenEdit.setText(cookie)
-                self.loginStatus.showMessage("Domain: "+domain+". Cookie: "+cookie)
-                print("Domain: "+domain+". Cookie: "+cookie)
-
-    def selectFolder(self):
-        datadir = self.folderEdit.text()
-        datadir = os.path.dirname(self.mainWindow.settings.value('lastpath', '')) if datadir == '' else datadir 
-        datadir = os.path.expanduser('~') if datadir == '' else datadir        
-        
-        dlg = SelectFolderDialog(self, 'Select Upload Folder', datadir)
-        if dlg.exec_():
-            if dlg.optionNodes.isChecked():
-                newnodes = [os.path.basename(f)  for f in dlg.selectedFiles()]
-                self.mainWindow.tree.treemodel.addSeedNodes(newnodes)
-                folder = os.path.dirname(dlg.selectedFiles()[0])
-                self.folderEdit.setText(folder)            
-            else:
-                folder = dlg.selectedFiles()[0]
-                self.folderEdit.setText(folder)
-
-    def selectDownloadFolder(self):
-        datadir = self.downloadfolderEdit.text()
-        datadir = os.path.dirname(self.mainWindow.settings.value('lastpath', '')) if datadir == '' else datadir
-        datadir = os.path.expanduser('~') if datadir == '' else datadir
-
-        dlg = SelectFolderDialog(self, 'Select Download Folder', datadir)
-        if dlg.exec_():
-            if dlg.optionNodes.isChecked():
-                newnodes = [os.path.basename(f) for f in dlg.selectedFiles()]
-                self.mainWindow.tree.treemodel.addSeedNodes(newnodes)
-                folder = os.path.dirname(dlg.selectedFiles()[0])
-                self.downloadfolderEdit.setText(folder)
-            else:
-                folder = dlg.selectedFiles()[0]
-                self.downloadfolderEdit.setText(folder)
-
-
-class AuthTab(ApiTab):
-    """
-    Module providing authorization
-    - init input fields
-    - login windows
-    - open authorization support
-    """
-
-    # see YoutubeTab for keys in the options-parameter
-    def __init__(self, mainWindow=None, name='NoName'):
-        super(AuthTab, self).__init__(mainWindow, name)
-
-        self.defaults['login_buttoncaption'] = " Login "
-        self.defaults['login_window_caption'] = "Login Page"
-        self.defaults['auth_type'] = "OAuth2"
-
-    def initAuthSetupInputs(self):
-        authlayout = QFormLayout()
-        authlayout.setContentsMargins(0, 0, 0, 0)
-        self.authWidget.setLayout(authlayout)
-
-        self.authTypeEdit = QComboBox()
-        self.authTypeEdit.addItems(['OAuth2', 'Twitter App-only','Cookie'])
-        authlayout.addRow("Authentication type", self.authTypeEdit)
-
-        self.authURIEdit = QLineEdit()
-        authlayout.addRow("Login URI", self.authURIEdit)
-
-        self.redirectURIEdit = QLineEdit()
-        authlayout.addRow("Redirect URI", self.redirectURIEdit)
-
-        self.tokenURIEdit = QLineEdit()
-        authlayout.addRow("Token URI", self.tokenURIEdit)
-
-        self.clientIdEdit = QLineEdit()
-        self.clientIdEdit.setEchoMode(QLineEdit.Password)
-        authlayout.addRow("Client Id", self.clientIdEdit)
-
-        self.clientSecretEdit = QLineEdit()
-        self.clientSecretEdit.setEchoMode(QLineEdit.Password)
-        authlayout.addRow("Client Secret", self.clientSecretEdit)
-
-        self.scopeEdit = QLineEdit()
-        authlayout.addRow("Scopes", self.scopeEdit)
-
-        self.proxyEdit = QLineEdit()
-        self.proxyEdit .setToolTip(wraptip("The proxy will be used for fetching data only, not for the login procedure."))
-        authlayout.addRow("Proxy", self.proxyEdit)
-
-
-    def initLoginInputs(self, toggle=True):
-        # token and login button
-        loginlayout = QHBoxLayout()
-
-        if toggle:
-            self.authEdit = QComboBox(self)
-            self.authEdit.addItems(['disable', 'param', 'header'])
-            self.authEdit.setToolTip(wraptip(
-                "Disable: no authorization. Param: an access_token parameter containing the access token will be added to the query. Header: a bearer token header containing the access token will be sent."))
-            loginlayout.addWidget(self.authEdit)
-
-            loginlayout.addWidget(QLabel("Name"))
-            self.tokenNameEdit = QLineEdit()
-            self.tokenNameEdit.setToolTip(wraptip("The name of the access token parameter or the authorization header. If you leave this empty, the default value is 'access_token' for param-method and 'Authorization' for header-method. The authorization header value is automatically prefixed with 'Bearer '"))
-            loginlayout.addWidget(self.tokenNameEdit,1)
-
-            rowcaption = "Authorization"
-            loginlayout.addWidget(QLabel("Access token"))
-        else:
-            rowcaption = "Access token"
-
-        self.tokenEdit = QLineEdit()
-        self.tokenEdit.setEchoMode(QLineEdit.Password)
-        loginlayout.addWidget(self.tokenEdit,2)
-
-        self.authButton = QPushButton('Settings', self)
-        self.authButton.clicked.connect(self.editAuthSettings)
-        loginlayout.addWidget(self.authButton)
-
-        self.loginButton = QPushButton(self.defaults.get('login_buttoncaption', "Login"), self)
-        self.loginButton.setToolTip(wraptip(
-            "Sometimes you need to register your own app at the platform of the API provider. Adjust the settings and login,"))
-        self.loginButton.clicked.connect(self.doLogin)
-        loginlayout.addWidget(self.loginButton)
-
-        #self.mainLayout.addRow(rowcaption, loginwidget)
-        self.extraLayout.addRow(rowcaption, loginlayout)
-
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(AuthTab, self).getOptions(purpose)
-
-        # Auth type
-        try:
-            options['auth_type'] = self.authTypeEdit.currentText().strip() if self.authTypeEdit.currentText() != "" else self.defaults.get('auth_type', '')
-        except AttributeError:
-            pass
-
-        # OAUTH URIs
-        try:
-            options[
-                'auth_uri'] = self.authURIEdit.text().strip() if self.authURIEdit.text() != "" else self.defaults.get(
-                'auth_uri', '')
-            options[
-                'redirect_uri'] = self.redirectURIEdit.text().strip() if self.redirectURIEdit.text() != "" else self.defaults.get(
-                'redirect_uri', '')
-            options[
-                'token_uri'] = self.tokenURIEdit.text().strip() if self.tokenURIEdit.text() != "" else self.defaults.get(
-                'token_uri', '')
-        except AttributeError:
-            options['auth_uri'] = self.defaults.get('auth_uri', '')
-            options['redirect_uri'] = self.defaults.get('redirect_uri', '')
-            options['token_uri'] = self.defaults.get('token_uri', '')
-
-        try:
-            options[
-                'auth'] = self.authEdit.currentText().strip() if self.authEdit.currentText() != "" else self.defaults.get(
-                'auth', 'disable')
-            if self.tokenNameEdit.text() != "":
-                options['auth_tokenname'] = self.tokenNameEdit.text()
-            else:
-                options.pop('auth_tokenname', None)
-
-        except AttributeError:
-            options.pop('auth_tokenname',None)
-            options['auth'] = self.defaults.get('auth', 'disable')
-
-        return options
-
-    def setOptions(self, options):
-        try:
-            self.authTypeEdit.setCurrentIndex(
-                self.authTypeEdit.findText(options.get('auth_type', self.defaults.get('auth_type', 'OAuth2'))))
-            self.authURIEdit.setText(options.get('auth_uri'))
-            self.redirectURIEdit.setText(options.get('redirect_uri'))
-            self.tokenURIEdit.setText(options.get('token_uri'))
-        except AttributeError:
-            pass
-
-        try:
-            self.authEdit.setCurrentIndex(self.authEdit.findText(options.get('auth', 'disable')))
-            self.tokenNameEdit.setText(options.get('auth_tokenname'))
-        except AttributeError:
-            pass
-
-        super(AuthTab, self).setOptions(options)
-
-
     def initPagingOptions(self, data, options):
+
+        # only empty if requested
+        if options.get('emptyonly', False):
+            lastdata = getDictValueOrNone(options, 'lastdata', dump=False)
+            if lastdata is not None:
+                return None
+
         # paging by auto count
         if (options.get('paging_type') == "count") and (options.get('param_paging', '') is not None):
             offset = options.get('offset_start', 1)
@@ -1424,7 +1060,7 @@ class AuthTab(ApiTab):
         # paging by key (continue previous fetching process based on last fetched child offcut node)
         elif (options.get('paging_type') == "key") and (options.get('key_paging') is not None) and (options.get('param_paging') is not None):
             # Get cursor of last offcut node
-            offcut = getDictValueOrNone(options, 'offcut.response', dump=False)
+            offcut = getDictValueOrNone(options, 'lastdata.response', dump=False)
             cursor = getDictValueOrNone(offcut,options.get('key_paging'))
             stopvalue = not extractValue(offcut,options.get('paging_stop'), dump = False, default = True)[1]
 
@@ -1438,7 +1074,7 @@ class AuthTab(ApiTab):
 
         # url based paging
         elif (options.get('paging_type') == "url") and (options.get('key_paging') is not None):
-            offcut = getDictValueOrNone(options, 'offcut.response', dump=False)
+            offcut = getDictValueOrNone(options, 'lastdata.response', dump=False)
             url = getDictValueOrNone(offcut,options.get('key_paging'))
 
             # Dont't fetch if already finished (=offcut without next cursor)
@@ -1451,7 +1087,7 @@ class AuthTab(ApiTab):
                 options['url'] = url
 
         elif (options.get('paging_type') == "decrease"):
-            node= getDictValueOrNone(options, 'offcut.response', dump=False)
+            node= getDictValueOrNone(options, 'lastdata.response', dump=False)
             cursor = getDictValueOrNone(node, options.get('key_paging'))
 
             if (node is not None):
@@ -1466,7 +1102,7 @@ class AuthTab(ApiTab):
 
         # break if "continue pagination" is checked and data already present
         elif options.get('resume',False):
-            offcut = getDictValueOrNone(options, 'offcut.response', dump=False)
+            offcut = getDictValueOrNone(options, 'lastdata.response', dump=False)
 
             # Dont't fetch if already finished (=offcut)
             if (offcut is not None):
@@ -1532,11 +1168,608 @@ class AuthTab(ApiTab):
 
         return options
 
+    def buildUrl(self, nodedata, options, logProgress=None):
+        if not ('url' in options):
+            urlpath = options["basepath"].strip() + options['resource'].strip() + options.get('extension', '')
+            urlparams = {}
+            urlparams.update(options['params'])
+            urlpath, urlparams, templateparams = self.getURL(urlpath, urlparams, nodedata, options)
+            requestheaders = options.get('headers', {})
+
+            # Authorization
+            if options.get('auth','disable') != 'disable':
+                token = options.get('auth_prefix','') + options.get('access_token','')
+                if options.get('auth') == 'param':
+                    urlparams[options.get('auth_tokenname')] = token
+                elif (options.get('auth') == 'header'):
+                    requestheaders[options.get('auth_tokenname')] = token
+
+            method = options.get('verb', 'GET')
+            payload = self.getPayload(options.get('payload', None), templateparams, nodedata, options, logProgress)
+            if isinstance(payload, MultipartEncoder) or isinstance(payload, MultipartEncoderMonitor):
+                requestheaders["Content-Type"] = payload.content_type
+        else:
+            method = options.get('verb', 'GET')
+            payload = None
+            urlpath = options['url']
+            urlparams = options['params']
+            requestheaders = {}
+
+        # sign request (for Amazon tab)
+        if hasattr(self, "signRequest"):
+            requestheaders = self.signRequest(urlpath, urlparams, requestheaders, method, payload, options)
+
+        return method, urlpath, urlparams, payload, requestheaders
+
+    def initSession(self, no=0, renew=False):
+        """
+        Return existing session or create a new session if necessary
+        :param no: Session number
+        :return: session
+        """
+        with self.lock_session:
+            while (len(self.sessions) <= no):
+                self.sessions.append(None)
+
+            session = self.sessions[no] if not renew else None
+
+            if session is None:
+                session = requests.Session()
+                session.proxies.update(self.getProxies())
+
+                # Mount new adapters = don't cache connections
+                adapter = requests.adapters.HTTPAdapter()
+                session.mount('http://', adapter)
+                session.mount('https://', adapter)
+                session.mount('file://', LocalFileAdapter())
+
+            self.sessions[no] = session
+
+        return session
+
+    def closeSession(self, no=0):
+        """
+        Close the session
+        :param no: number of session
+        :return: None
+        """
+        with self.lock_session:
+            if (len(self.sessions) > no) and (self.sessions[no] is not None):
+                self.sessions[no].close()
+                self.sessions[no] = None
+
+    def request(self, session_no=0, path=None, args=None, headers=None, method="GET", payload=None,foldername=None,
+                                                      filename=None, fileext=None, format='json'):
+        """
+        Start a new threadsafe session and request
+        """
+
+        def download(response,foldername=None,filename=None,fileext=None):
+            if foldername is not None and filename is not None:
+                if fileext is None:
+                    contentype = response.headers.get("content-type")
+                    if contentype is not None:
+                        guessed_ext = guess_all_extensions(contentype)
+                        fileext = guessed_ext[-1] if len(guessed_ext) > 0 else None
+                    else:
+                        fileext = None
+
+
+                fullfilename = makefilename(path,foldername, filename, fileext)
+                file = open(fullfilename, 'wb')
+            else:
+                fullfilename = None
+                file = None
+
+            # requests completely downloads data to memory if not stream=True
+            # iter_content, text and content all fall back to the previously downloaded content
+            # no need to download into string object a second time
+
+            try:
+                content = io.BytesIO()
+                try:
+                    for chunk in response.iter_content(1024):
+                        content.write(chunk)
+                        if file is not None:
+                            file.write(chunk)
+
+
+                    out = content.getvalue()
+                    encoding = cchardet.detect(out)['encoding'] #encoding = 'utf-8'
+                    out = out.decode(encoding)
+
+                except Exception as e:
+                    out = str(e)
+                finally:
+                    content.close()
+            finally:
+                if file is not None:
+                    file.close()
+
+            # if file is not None:
+            #     try:
+            #         for chunk in response.iter_content(1024):
+            #             file.write(chunk)
+            #     finally:
+            #         file.close()
+
+
+            return (fullfilename, out)
+
+        #Throttle speed
+        if (self.speed is not None) and (self.lastrequest is not None):
+            pause = ((60 * 1000) / float(self.speed)) - self.lastrequest.msecsTo(QDateTime.currentDateTime())
+            while (self.connected) and (pause > 0):
+                time.sleep(0.1)
+                pause = ((60 * 1000) / float(self.speed)) - self.lastrequest.msecsTo(QDateTime.currentDateTime())
+
+        self.lastrequest = QDateTime.currentDateTime()
+
+        if session_no is None:
+            session_no = 0
+            self.closeSession(session_no)
+
+        session = self.initSession(session_no)
+
+        try:
+            response = None
+            try:
+                maxretries = 3
+                while True:
+                    try:
+                        if (not session):
+                            raise Exception("No session available.")
+
+                        # Use cookie jar instead of header to persist redirects
+                        cookies = headers.pop('Cookie', None) if headers is not None else None
+                        if cookies is not None:
+                            cookies = dict(item.split("=",maxsplit=1) for item in cookies.split(";"))
+
+                        # Send request
+                        response = session.request(method,path, params=args, headers=headers, cookies=cookies,
+                                                   data=payload, timeout=self.timeout,stream=True,verify=True) # verify=False
+
+                    except (HTTPError, ConnectionError) as e:
+                        maxretries -= 1
+
+                        # Try next request with new session
+                        if (maxretries > 0) and (self.connected):
+                            time.sleep(0.1)
+                            session = self.initSession(session_no, True)
+                            self.logMessage("Automatic retry: Request Error: {0}".format(str(e)))
+                        else:
+                            raise e
+                    else:
+                        break
+
+                if int(response.headers.get('content-length',0)) > (self.maxsize * 1024 * 1024):
+                    raise DataTooBigError(f"File is too big, content length is {response.headers['content-length']}.")
+
+                status = 'fetched' if response.ok else 'error'
+                status = status + ' (' + str(response.status_code) + ')'
+                headers = dict(list(response.headers.items()))
+
+                # Download data
+                data = {
+                    'content-type': response.headers.get("content-type",""),
+                    'sourcepath': path,'sourcequery': args,'finalurl': response.url
+                }
+
+                fullfilename, content = download(response, foldername, filename, fileext)
+
+                if fullfilename is not None:
+                    data['filename'] = os.path.basename(fullfilename)
+                    data['filepath'] = fullfilename
+
+                # Text
+                if format == 'text':
+                        data['text'] = content  # str(response.text)
+
+                 # Scrape links
+                elif format == 'links':
+                    try:
+                        links, base = extractLinks(content, response.url)
+                        data['links'] = links
+                        data['base'] = base
+                    except Exception as  e:
+                        data['error'] = 'Could not extract Links.'
+                        data['message'] = str(e)
+                        data['response'] = content
+
+                # JSON
+                elif format == 'json':
+                    try:
+                        data = json.loads(content) if content != '' else []
+                    except Exception as e:
+                        # self.logMessage("No valid JSON data, try to convert XML to JSON ("+str(e)+")")
+                        # try:
+                        #     data = xmlToJson(response.text)
+                        # except:
+                        data = {
+                            'error': 'Data could not be converted to JSON',
+                            'response': content,
+                            'exception':str(e)
+                        }
+
+                # JSON
+                elif format == 'xml':
+                    try:
+                        data = xmlToJson(content)
+                    except Exception as e:
+                        data = {
+                            'error': 'Data could not be converted to JSON',
+                            'response': content,
+                            'exception':str(e)
+                        }
+
+
+            except Exception as e:
+            #except (DataTooBigError, HTTPError, ReadTimeout, ConnectionError, InvalidURL, MissingSchema) as e:
+                status = 'request error'
+                data = {'error':str(e)}
+                headers = {}
+
+                #raise Exception("Request Error: {0}".format(str(e)))
+        finally:
+            if response is not None:
+                response.close()
+
+            return data, headers, status
+
+
+    def disconnectSocket(self):
+        """Used to hardly disconnect the streaming client"""
+        self.connected = False
+        while (len(self.sessions) > 0):
+            session = self.sessions.pop()
+            session.close()
+
+        #self.response.raw._fp.close()
+        #self.response.close()
+
+    @Slot()
+    def captureData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
+        session_no = options.get('threadnumber',0)
+        self.connected = True
+
+        # Init pagination
+        options = self.initPagingOptions(nodedata, options)
+        if options is None:
+            return False
+
+        # file settings
+        foldername, filename, fileext = self.getFileFolderName(options, nodedata)
+
+        format = options.get('format', 'json')
+        if format == 'file':
+            if (foldername is None) or (not os.path.isdir(foldername)):
+                raise Exception("Folder does not exists, select download folder, please!")
+
+        # build url
+        method, urlpath, urlparams, payload, requestheaders = self.buildUrl(nodedata, options, logProgress)
+
+        if not urlpath:
+            logMessage("Empty path, node {0} skipped.".format(nodedata['objectid']))
+            return False
+
+        if not urlpath.startswith(('https://','http://','file://')):
+            logMessage("Http or https missing in path, node {0} skipped.".format(nodedata['objectid']))
+            return False
+
+        if options['logrequests']:
+            logpath = self.getLogURL(urlpath,urlparams,options)
+            logMessage("Capturing data for {0} from {1}".format(nodedata['objectid'], logpath))
+
+        # Show browser
+        self.browserWindow = BrowserDialog(self.mainWindow, "Browser", 800, 600)
+        self.browserWindow.logMessage.connect(logMessage)
+        self.browserWindow.activateCaptureButton(logData)
+        url = urlpath + '?' + urllib.parse.urlencode(urlparams)
+        self.browserWindow.loadPage(url, requestheaders, options, foldername, filename, fileext)
+
+        # for data, headers, status in self.browserWindow.capturePage(
+        #         session_no,urlpath, urlparams, requestheaders, method, payload,
+        #         foldername, filename, fileext, format=format, strip):
+        #     options['querytime'] = str(datetime.now())
+        #     options['querystatus'] = status
+        #     logData(data, options, headers)
+
+        return True
+
+    @Slot()
+    def loadFinished(self, success):
+        if (not success and not self.loginWindow.stopped):
+            self.logMessage('Error loading web page')
+
+
+    def selectFolder(self):
+        datadir = self.folderEdit.text()
+        datadir = os.path.dirname(self.mainWindow.settings.value('lastpath', '')) if datadir == '' else datadir 
+        datadir = os.path.expanduser('~') if datadir == '' else datadir        
+        
+        dlg = SelectFolderDialog(self, 'Select Upload Folder', datadir)
+        if dlg.exec_():
+            if dlg.optionNodes.isChecked():
+                newnodes = [os.path.basename(f)  for f in dlg.selectedFiles()]
+                self.mainWindow.tree.treemodel.addSeedNodes(newnodes)
+                folder = os.path.dirname(dlg.selectedFiles()[0])
+                self.folderEdit.setText(folder)            
+            else:
+                folder = dlg.selectedFiles()[0]
+                self.folderEdit.setText(folder)
+
+    def selectDownloadFolder(self):
+        datadir = self.downloadfolderEdit.text()
+        datadir = os.path.dirname(self.mainWindow.settings.value('lastpath', '')) if datadir == '' else datadir
+        datadir = os.path.expanduser('~') if datadir == '' else datadir
+
+        dlg = SelectFolderDialog(self, 'Select Download Folder', datadir)
+        if dlg.exec_():
+            if dlg.optionNodes.isChecked():
+                newnodes = [os.path.basename(f) for f in dlg.selectedFiles()]
+                self.mainWindow.tree.treemodel.addSeedNodes(newnodes)
+                folder = os.path.dirname(dlg.selectedFiles()[0])
+                self.downloadfolderEdit.setText(folder)
+            else:
+                folder = dlg.selectedFiles()[0]
+                self.downloadfolderEdit.setText(folder)
+
+
+class AuthTab(ApiTab):
+    """
+    Module providing authorization
+    - init input fields
+    - login windows
+    - open authorization support
+    """
+
+    # see YoutubeTab for keys in the options-parameter
+    def __init__(self, mainWindow=None, name='NoName'):
+        super(AuthTab, self).__init__(mainWindow, name)
+
+        self.loginServerInstance = None
+
+        self.defaults['login_buttoncaption'] = " Login "
+        self.defaults['login_window_caption'] = "Login Page"
+        self.defaults['auth_type'] = "Disable"
+
+    def cleanup(self):
+        if self.loginServerInstance is not None:
+            self.loginServerInstance.shutdown()
+
+    def initAuthSetupInputs(self):
+        authlayout = QFormLayout()
+        authlayout.setContentsMargins(0, 0, 0, 0)
+        self.authWidget.setLayout(authlayout)
+
+        self.authTypeEdit = QComboBox()
+        self.authTypeEdit.addItems(['Disable','API key','OAuth2', 'Cookie', 'OAuth2 Client Credentials'])
+        authlayout.addRow("Authentication type", self.authTypeEdit)
+
+        self.authURIEdit = QLineEdit()
+        authlayout.addRow("Login URI", self.authURIEdit)
+
+        self.redirectURIEdit = QLineEdit()
+        authlayout.addRow("Redirect URI", self.redirectURIEdit)
+
+        self.tokenURIEdit = QLineEdit()
+        authlayout.addRow("Token URI", self.tokenURIEdit)
+
+        self.clientIdEdit = QLineEdit()
+        self.clientIdEdit.setEchoMode(QLineEdit.Password)
+        authlayout.addRow("Client Id", self.clientIdEdit)
+
+        self.clientSecretEdit = QLineEdit()
+        self.clientSecretEdit.setEchoMode(QLineEdit.Password)
+        authlayout.addRow("Client Secret", self.clientSecretEdit)
+
+        self.scopeEdit = QLineEdit()
+        authlayout.addRow("Scopes", self.scopeEdit)
+
+        self.proxyEdit = QLineEdit()
+        self.proxyEdit .setToolTip(wraptip("The proxy will be used for fetching data only, not for the login procedure."))
+        authlayout.addRow("Proxy", self.proxyEdit)
+
+
+    @Slot()
+    def editAuthSettings(self):
+        dialog = QDialog(self,Qt.WindowSystemMenuHint | Qt.WindowTitleHint)
+        dialog.setWindowTitle("Authentication settings")
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.authWidget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        dialog.setLayout(layout)
+
+        def close():
+            dialog.close()
+
+        def apply():
+            # Auth type: 'Disable','API key','OAuth2', 'OAuth2 Client Credentials','Cookie'
+            try:
+                if self.authTypeEdit.currentText() == 'Disable':
+                    self.authEdit.setCurrentIndex(self.authEdit.findText('disable'))
+                    self.tokenNameEdit.setText('')
+                elif self.authTypeEdit.currentText() == 'API key':
+                    pass
+                elif self.authTypeEdit.currentText() == 'OAuth2':
+                    self.authEdit.setCurrentIndex(self.authEdit.findText('header'))
+                    self.tokenNameEdit.setText('Authorization')
+                elif self.authTypeEdit.currentText() == 'OAuth2 Client Credentials':
+                    self.authEdit.setCurrentIndex(self.authEdit.findText('header'))
+                    self.tokenNameEdit.setText('Authorization')
+                elif self.authTypeEdit.currentText() == 'Cookie':
+                    self.authEdit.setCurrentIndex(self.authEdit.findText('header'))
+                    self.tokenNameEdit.setText('Cookie')
+
+            except AttributeError:
+                pass
+
+            dialog.close()
+
+        #connect the nested functions above to the dialog-buttons
+        buttons.accepted.connect(apply)
+        buttons.rejected.connect(close)
+        dialog.exec_()
+
+    def initLoginInputs(self, toggle=True):
+        # token and login button
+        loginlayout = QHBoxLayout()
+
+        if toggle:
+            self.authEdit = QComboBox(self)
+            self.authEdit.addItems(['disable', 'param', 'header'])
+            self.authEdit.setToolTip(wraptip(
+                "Disable: no authorization. Param: an access_token parameter containing the access token will be added to the query. Header: a header containing the access token will be sent."))
+            loginlayout.addWidget(self.authEdit)
+
+            loginlayout.addWidget(QLabel("Name"))
+            self.tokenNameEdit = QLineEdit()
+            self.tokenNameEdit.setToolTip(wraptip("The name of the access token parameter or the authorization header. If you select an authentication method different from API key (e.g. OAuth2 or Cookie), name the is overriden by the selected method."))
+            # If you leave this empty, the default value is 'access_token' for param-method and 'Authorization' for header-method.
+            loginlayout.addWidget(self.tokenNameEdit,1)
+
+            rowcaption = "Authorization"
+            loginlayout.addWidget(QLabel("Access token"))
+        else:
+            rowcaption = "Access token"
+
+        self.tokenEdit = QLineEdit()
+        self.tokenEdit.setEchoMode(QLineEdit.Password)
+        loginlayout.addWidget(self.tokenEdit,2)
+
+        self.authButton = QPushButton('Settings', self)
+        self.authButton.clicked.connect(self.editAuthSettings)
+        loginlayout.addWidget(self.authButton)
+
+        self.loginButton = QPushButton(self.defaults.get('login_buttoncaption', "Login"), self)
+        self.loginButton.setToolTip(wraptip(
+            "Sometimes you need to register your own app at the platform of the API provider. Adjust the settings and login,"))
+        self.loginButton.clicked.connect(self.doLogin)
+        loginlayout.addWidget(self.loginButton)
+
+        #self.mainLayout.addRow(rowcaption, loginwidget)
+        self.extraLayout.addRow(rowcaption, loginlayout)
+
+    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(AuthTab, self).getOptions(purpose)
+
+        # Auth type
+        try:
+            options['auth_type'] = self.authTypeEdit.currentText().strip() if self.authTypeEdit.currentText() != "" else self.defaults.get('auth_type', '')
+        except AttributeError:
+            self.defaults.get('auth_type', '')
+
+        # OAUTH URIs
+        try:
+            options[
+                'auth_uri'] = self.authURIEdit.text().strip() if self.authURIEdit.text() != "" else self.defaults.get(
+                'auth_uri', '')
+            options[
+                'redirect_uri'] = self.redirectURIEdit.text().strip() if self.redirectURIEdit.text() != "" else self.defaults.get(
+                'redirect_uri', '')
+            options[
+                'token_uri'] = self.tokenURIEdit.text().strip() if self.tokenURIEdit.text() != "" else self.defaults.get(
+                'token_uri', '')
+        except AttributeError:
+            options['auth_uri'] = self.defaults.get('auth_uri', '')
+            options['redirect_uri'] = self.defaults.get('redirect_uri', '')
+            options['token_uri'] = self.defaults.get('token_uri', '')
+
+        try:
+            options['auth'] = self.authEdit.currentText().strip() \
+                if self.authEdit.currentText() != "" \
+                else self.defaults.get('auth', 'disable')
+
+            options['auth_tokenname'] = self.tokenNameEdit.text()
+
+        except AttributeError:
+            options.pop('auth_tokenname',None)
+            options['auth'] = self.defaults.get('auth', 'disable')
+
+        # Override authorization settings (token handling)
+        # based on authentication settings
+
+        if options.get('auth_type') == 'OAuth2':
+            #options['auth'] = 'header'
+            options['auth_prefix'] = "Bearer "
+            #options['auth_tokenname'] = "Authorization"
+        elif options.get('auth_type') == 'OAuth2 Client Credentials':
+            #options['auth'] = 'header'
+            options['auth_prefix'] = "Bearer "
+            #options['auth_tokenname'] = "Authorization"
+        elif options.get('auth_type') == 'OAuth1':
+            #options['auth'] = 'disable' # managed by Twitter module
+            options['auth_prefix'] = ''
+            #options['auth_tokenname'] = ''
+        elif options.get('auth_type') == 'Cookie':
+            #options['auth'] = 'header'
+            options['auth_prefix'] = ''
+            #options['auth_tokenname'] = 'Cookie'
+
+        if options['auth'] == 'disable':
+            options['auth_prefix'] = ''
+            options['auth_tokenname'] = ''
+
+        return options
+
+    def setOptions(self, options):
+        # Legacy types
+        if options.get('auth_type') == 'Twitter OAuth1':
+            options['auth_type'] = 'OAuth1'
+        if options.get('auth_type') == 'Twitter App-only':
+            options['auth_type'] = 'OAuth2 Client Credentials'
+
+        # Override defaults
+        if options.get('auth_type') == 'OAuth2':
+            options['auth'] = 'header'
+            options['auth_prefix'] = "Bearer "
+            options['auth_tokenname'] = "Authorization"
+        elif options.get('auth_type') == 'OAuth2 Client Credentials':
+            options['auth'] = 'header'
+            options['auth_prefix'] = "Bearer "
+            options['auth_tokenname'] = "Authorization"
+        elif options.get('auth_type') == 'OAuth1':
+            options['auth'] = 'disable' # managed by Twitter module
+            options['auth_prefix'] = ''
+            options['auth_tokenname'] = ''
+        elif options.get('auth_type') == 'Cookie':
+            options['auth'] = 'header'
+            options['auth_prefix'] = ''
+            options['auth_tokenname'] = 'Cookie'
+
+        try:
+            self.authTypeEdit.setCurrentIndex( \
+                self.authTypeEdit.findText(options.get('auth_type', \
+                self.defaults.get('auth_type', 'Disable'))))
+            self.authURIEdit.setText(options.get('auth_uri'))
+            self.redirectURIEdit.setText(options.get('redirect_uri'))
+            self.tokenURIEdit.setText(options.get('token_uri'))
+        except AttributeError:
+            pass
+
+        try:
+            self.authEdit.setCurrentIndex(self.authEdit.findText(options.get('auth', 'disable')))
+            self.tokenNameEdit.setText(options.get('auth_tokenname'))
+        except AttributeError:
+            pass
+
+        super(AuthTab, self).setOptions(options)
+
     def fetchData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
+        # Preconditions
+        if not self.auth_userauthorized and self.auth_preregistered:
+            raise Exception('You are not authorized, login please!')
+
         session_no = options.get('threadnumber',0)
         self.closeSession(session_no)
         self.connected = True
         self.speed = options.get('speed', None)
+        self.timeout = options.get('timeout', 15)
+        self.maxsize = options.get('maxsize', 5)
 
         # Init pagination
         options = self.initPagingOptions(nodedata, options)
@@ -1558,15 +1791,18 @@ class AuthTab(ApiTab):
 
 
             # build url
-            method, urlpath, urlparams, payload, requestheaders  = self.buildUrl(nodedata, options, logProgress)
+            method, urlpath, urlparams, payload, requestheaders = self.buildUrl(nodedata, options, logProgress)
 
             if not urlpath:
-                logMessage("Empty path, node skipped {0}.".format(nodedata['objectid']))
+                logMessage("Empty path, node {0} skipped.".format(nodedata['objectid']))
+                return False
+
+            if not urlpath.startswith(('https://','http://','file://')):
+                logMessage("Http or https missing in path, node {0} skipped.".format(nodedata['objectid']))
                 return False
 
             if options['logrequests']:
-                logpath = urlpath + "?" + urllib.parse.urlencode(urlparams).replace( \
-                    options.get('access_token',''),'')
+                logpath = self.getLogURL(urlpath,urlparams,options)
                 logMessage("Fetching data for {0} from {1}".format(nodedata['objectid'], logpath))
 
             # data
@@ -1607,42 +1843,7 @@ class AuthTab(ApiTab):
 
         return True
 
-    def buildUrl(self, nodedata, options, logProgress):
-        if not ('url' in options):
-            urlpath = options["basepath"].strip() + options['resource'].strip() + options.get('pathextension', '')
-            urlparams = {}
-            urlparams.update(options['params'])
 
-            urlpath, urlparams, templateparams = self.getURL(urlpath, urlparams, nodedata, options)
-
-            requestheaders = options.get('headers', {})
-
-            if options.get('auth') == 'param':
-                urlparams[options.get('auth_tokenname', 'access_token')] = options['access_token']
-            elif (options.get('auth') == 'header') and options.get('auth_type') != 'Cookie':
-                requestheaders[options.get('auth_tokenname', 'Authorization')] = "Bearer " + options['access_token']
-            elif (options.get('auth') == 'header'):
-                requestheaders[options.get('auth_tokenname', 'Authorization')] = options['access_token']
-            # App auth
-            if options.get('auth_type','Twitter OAuth1') == 'Twitter App-only':
-                requestheaders["Authorization"] = "Bearer "+options['access_token']
-
-            method = options.get('verb', 'GET')
-            payload = self.getPayload(options.get('payload', None), templateparams, nodedata, options, logProgress)
-            if isinstance(payload, MultipartEncoder) or isinstance(payload, MultipartEncoderMonitor):
-                requestheaders["Content-Type"] = payload.content_type
-        else:
-            method = options.get('verb', 'GET')
-            payload = None
-            urlpath = options['url']
-            urlparams = options['params']
-            requestheaders = {}
-
-        # sign request (for Amazon tab)
-        if hasattr(self, "signRequest"):
-            requestheaders = self.signRequest(urlpath, urlparams, requestheaders, method, payload, options)
-
-        return method, urlpath, urlparams, payload, requestheaders
 
     @Slot()
     def doLogin(self, session_no = 0):
@@ -1652,47 +1853,31 @@ class AuthTab(ApiTab):
         :return:
         """
         self.closeSession(session_no)
+        options = self.getOptions()
 
-        if hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Twitter App-only':
+        if options['auth_type'] == 'OAuth2 Client Credentials':
             self.doTwitterAppLogin(session_no)
-        elif hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Twitter OAuth1':
+        elif options['auth_type'] == 'OAuth1':
             self.doOAuth1Login(session_no)
-        elif hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Cookie':
+        elif options['auth_type'] == 'Cookie':
             self.doCookieLogin(session_no)
+        elif options['auth_type'] == 'API key':
+            QMessageBox.information(self, "Facepager", "Manually enter your API key into the access token field or change the authentication method in the settings.")
+        elif options['auth_type'] == 'Disable':
+            QMessageBox.information(self, "Login disabled","No authentication method selected. Please choose a method in the settings.", QMessageBox.StandardButton.Ok)
+        elif options['auth_type'] == 'OAuth2 External':
+            self.doOAuth2ExternalLogin(session_no)
         else:
             self.doOAuth2Login(session_no)
 
     @Slot()
-    def getToken(self, url=False):
-        # if url is not False:
-        #    self.loginStatus.showMessage(url.toDisplayString() )
-        if hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Twitter App-only':
-            return False
-        elif hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Twitter OAuth1':
-            self.getOAuth1Token()
-        elif hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Cookie':
-            self.getCookieToken(url)
-        else:
-            self.getOAuth2Token(url)
-
-    @Slot()
-    def initSession(self, no=0, renew=False):
-        """
-        Dispatch session initialization to specialized functions
-        :param no: session number
-        :return: session object
-        """
-
-        if hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Twitter OAuth1':
-            return self.initOAuth1Session(no, renew)
-        elif hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'Twitter App-only':
-            return self.initOAuth2Session(no, renew)
-        else:
-            return self.initOAuth2Session(no, renew)
-
-    @Slot()
     def doOAuth1Login(self, session_no = 0):
         try:
+            # use credentials from input if provided
+            clientid = self.getClientId()
+            if clientid is None:
+                return False
+
             service = self.getOAuth1Service()
 
             self.oauthdata.pop('oauth_verifier', None)
@@ -1710,72 +1895,15 @@ class AuthTab(ApiTab):
                                  QMessageBox.StandardButton.Ok)
 
     @Slot()
-    def getOAuth1Token(self):
-        url = urllib.parse.parse_qs(self.login_webview.url().toString())
-        if "oauth_verifier" in url:
-            token = url["oauth_verifier"]
-            if token:
-                service = self.getOAuth1Service()
-                self.oauthdata['oauth_verifier'] = token[0]
-
-                session = service.get_auth_session(self.oauthdata['requesttoken'],
-                                                   self.oauthdata['requesttoken_secret'], method="POST",
-                                                   data={'oauth_verifier': self.oauthdata['oauth_verifier']})
-
-                self.tokenEdit.setText(session.access_token)
-                self.tokensecretEdit.setText(session.access_token_secret)
-
-                self.closeSession()
-                self.closeLoginWindow()
-
-    def getOAuth1Service(self):
-        if not hasattr(self,'oauthdata'):
-            self.oauthdata = {}
-
-        service = OAuth1Service(
-            consumer_key=self.defaults.get('consumer_key'),
-            consumer_secret=self.defaults.get('consumer_secret'),
-            name='oauth1',
-            access_token_url=self.defaults.get('access_token_url'),
-            authorize_url=self.defaults.get('authorize_url'),
-            request_token_url=self.defaults.get('request_token_url'),
-            base_url=self.defaults.get('basepath'))
-
-        service.consumer_key = self.clientIdEdit.text() if self.clientIdEdit.text() != "" else \
-            self.defaults['consumer_key']
-        service.consumer_secret = self.clientSecretEdit.text() if self.clientSecretEdit.text() != "" else \
-            self.defaults['consumer_secret']
-        service.base_url = self.basepathEdit.currentText().strip() if self.basepathEdit.currentText().strip() != "" else \
-            self.defaults['basepath']
-
-        if service.consumer_key == '':
-            raise Exception('Consumer key is missing, please adjust settings!')
-        if service.consumer_secret == '':
-            raise Exception('Consumer secret is missing, please adjust settings!')
-
-        return service
-
-    def initOAuth1Session(self,no=0, renew=False):
-        while (len(self.sessions) <= no):
-            self.sessions.append(None)
-
-        session = self.sessions[no] if not renew else None
-        if session is None:
-            if (self.tokenEdit.text() == '') or (self.tokensecretEdit.text() == ''):
-                raise Exception("No access, login please!")
-
-            service = self.getOAuth1Service()
-            session = service.get_session((self.tokenEdit.text(), self.tokensecretEdit.text()))
-
-        self.sessions[no] = session
-        return session
-
-    @Slot()
     def doOAuth2Login(self, session_no=0):
         try:
             options = self.getOptions()
 
-            clientid = self.clientIdEdit.text() if self.clientIdEdit.text() != "" else self.defaults.get('client_id','')
+            # use credentials from input if provided
+            clientid = self.getClientId()
+            if clientid is None:
+                return False
+
             scope = self.scopeEdit.text() if self.scopeEdit.text() != "" else self.defaults.get('scope', None)
             loginurl = options.get('auth_uri', '')
 
@@ -1792,8 +1920,11 @@ class AuthTab(ApiTab):
             if scope is not None:
                 params['scope'] = scope
 
-            params = '&'.join('%s=%s' % (key, value) for key, value in iter(params.items()))
-            url = loginurl + "?" + params
+
+            #params = '&'.join('%s=%s' % (key, value) for key, value in iter(params.items()))
+            #url =  loginurl + "?" + params
+            urlpath, urlparams, templateparams = self.getURL(loginurl,params,{},{})
+            url = urlpath + '?' + urllib.parse.urlencode(urlparams)
 
             self.showLoginWindow(self.defaults.get('login_window_caption', 'Login'),
                                  url,
@@ -1805,40 +1936,52 @@ class AuthTab(ApiTab):
                                  str(e),
                                  QMessageBox.StandardButton.Ok)
 
-    @Slot(QUrl)
-    def getOAuth2Token(self, url):
-        options = self.getOptions()
+    @Slot()
+    def doOAuth2ExternalLogin(self, session_no=0):
+        try:
+            options = self.getOptions()
 
-        if url.toString().startswith(options['redirect_uri']):
-            try:
-                clientid = self.clientIdEdit.text() if self.clientIdEdit.text() != "" \
-                    else self.defaults.get('client_id', '')
-                clientsecret = self.clientSecretEdit.text() if self.clientSecretEdit.text() != "" \
-                    else self.defaults.get('client_secret', '')
-                scope = self.scopeEdit.text() if self.scopeEdit.text() != "" else \
-                    self.defaults.get('scope', None)
+            # use credentials from input if provided
+            clientid = self.getClientId()
+            if clientid is None:
+                return False
 
-                session = OAuth2Session(clientid, redirect_uri=options['redirect_uri'], scope=scope)
-                token = session.fetch_token(options['token_uri'],
-                                                 authorization_response=str(url.toString()),
-                                                 client_secret=clientsecret)
+            scope = self.scopeEdit.text() if self.scopeEdit.text() != "" else self.defaults.get('scope', None)
+            loginurl = options.get('auth_uri', '')
 
-                self.tokenEdit.setText(token['access_token'])
+            if loginurl == '':
+                raise Exception('Login URL is missing, please adjust settings!')
 
-                try:
-                    self.authEdit.setCurrentIndex(self.authEdit.findText('header'))
-                except AttributeError:
-                    pass
+            if clientid == '':
+                raise Exception('Client Id is missing, please adjust settings!')
 
-            finally:
-                session.close()
-                self.closeLoginWindow()
+            self.startLoginServer(0)
+            redirect_uri = "http://localhost:"+str(self.loginServerInstance.server_port)
 
-    def initOAuth2Session(self, no=0, renew=False):
-        return super(AuthTab, self).initSession(no, renew)
+            params = {'client_id': clientid,
+                      'redirect_uri': redirect_uri,
+                      'response_type': options.get('response_type', 'code')}
+
+            if scope is not None:
+                params['scope'] = scope
+
+            params = '&'.join('%s=%s' % (key, value) for key, value in iter(params.items()))
+            url = loginurl + "?" + params
+
+            webbrowser.open(url)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Login canceled",
+                                 str(e),
+                                 QMessageBox.StandardButton.Ok)
+
 
     @Slot()
     def doCookieLogin(self, session_no=0):
+        def newCookie(domain, cookie):
+            self.tokenEdit.setText(cookie)
+            # print("Domain: "+domain+". Cookie: "+cookie)
+
         try:
             options = self.getOptions()
             url= options.get('auth_uri', '')
@@ -1846,26 +1989,27 @@ class AuthTab(ApiTab):
             if url == '':
                 raise Exception('Login URL is missing, please adjust settings!')
 
-            self.showLoginWindow(self.defaults.get('login_window_caption', 'Login'),
-                                 url,
-                                 self.defaults.get('login_window_width', 600),
-                                 self.defaults.get('login_window_height', 600)
-                                 )
+            self.loginWindow = BrowserDialog(
+                self.mainWindow,
+                self.defaults.get('login_window_caption', 'Login'),
+                self.defaults.get('login_window_width', 600),
+                self.defaults.get('login_window_height', 600)
+            )
+
+            self.loginWindow.logMessage.connect(self.logMessage)
+            self.loginWindow.activateCookieButton(newCookie)
+            self.loginWindow.loadPage(url)
 
         except Exception as e:
             QMessageBox.critical(self, "Login canceled",
                                  str(e),
                                  QMessageBox.StandardButton.Ok)
 
-    @Slot(QUrl)
-    def getCookieToken(self, url):
-        pass
-
-
     @Slot()
-    def doTwitterAppLogin(self):
+    def doTwitterAppLogin(self, session_no=0):
         try:
             # See https://developer.twitter.com/en/docs/basics/authentication/overview/application-only
+            self.auth_preregistered = False
             clientid = self.clientIdEdit.text() # no defaults
             if clientid == '':
                 raise Exception('Client Id is missing, please adjust settings!')
@@ -1874,16 +2018,20 @@ class AuthTab(ApiTab):
             if clientsecret == '':
                 raise Exception('Client Secret is missing, please adjust settings!')
 
+            options = self.getOptions()
+            path= options.get('auth_uri', '')
+            if path == '':
+                raise Exception('Login URL is missing, please adjust settings!')
+
+
             basicauth = urllib.parse.quote_plus(clientid) + ':' + urllib.parse.quote_plus(clientsecret)
             basicauth = base64.b64encode(basicauth.encode('utf-8')).decode('utf-8')
 
-            path = 'https://api.twitter.com/oauth2/token/'
             payload = 'grant_type=client_credentials'
             headers = {'Authorization': 'Basic ' + basicauth,
                        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'}
-            session_no = 0
-            self.closeSession(session_no)
-            data, headers, status = self.request(session_no, path, payload=payload, headers=headers, method="POST")
+
+            data, headers, status = self.request(None, path, payload=payload, headers=headers, method="POST")
 
             token = data.get('access_token', '')
             self.tokenEdit.setText(token)
@@ -1904,19 +2052,378 @@ class AuthTab(ApiTab):
                                  QMessageBox.StandardButton.Ok)
 
 
+    @Slot()
+    def showLoginWindow(self, caption='', url='',width=600,height=600):
+        """
+        Create a SSL-capable WebView for the login-process
+        Uses a Custom QT-Webpage Implementation
+        Supply a onLoginWindowChanged-Slot to fetch the API-Token
+        """
+
+        self.loginWindow = QMainWindow(self.mainWindow)
+        self.loginWindow.setAttribute(Qt.WA_DeleteOnClose)
+        self.loginWindow.resize(width, height)
+        self.loginWindow.setWindowTitle(caption)
+        self.loginWindow.stopped = False
+        self.loginWindow.cookie = ''
+
+
+        #create WebView with Facebook log-Dialog, OpenSSL needed
+        self.loginStatus = self.loginWindow.statusBar()
+        self.login_webview = QWebEngineView(self.loginWindow)
+        self.loginWindow.setCentralWidget(self.login_webview)
+
+        # Use the custom- WebPage class
+        webpage = WebPageCustom(self.login_webview)
+        webpage.logMessage.connect(self.logMessage)
+        self.login_webview.setPage(webpage)
+
+        #Connect to the onLoginWindowChanged-method
+        self.login_webview.urlChanged.connect(self.onLoginWindowChanged)
+        webpage.urlNotFound.connect(self.onLoginWindowChanged) #catch redirects to localhost or nonexistent uris
+
+        # Connect to the loadFinished-Slot for an error message
+        self.login_webview.loadFinished.connect(self.loadFinished)
+
+        self.login_webview.load(QUrl(url))
+        self.login_webview.show()
+        self.loginWindow.show()
+
+    @Slot()
+    def closeLoginWindow(self):
+        if self.loginWindow is None:
+            return False
+
+        self.loginWindow.stopped = True
+        self.login_webview.stop()
+        self.loginWindow.close()
+        self.loginWindow = None
+
+    @Slot()
+    def onLoginWindowChanged(self, url=False):
+        options = self.getOptions()
+
+        if options['auth_type'] == 'OAuth2 Client Credentials':
+            return False
+        elif options['auth_type'] == 'OAuth1':
+            url = self.login_webview.url().toString()
+            success = self.getOAuth1Token(url)
+            if success:
+                self.closeLoginWindow()
+        else:
+            url = url.toString()
+            options = self.getOptions()
+            if url.startswith(options['redirect_uri']):
+                if self.getOAuth2Token(url):
+                    self.closeLoginWindow()
+
+    @Slot()
+    def startLoginServer(self, port):
+        self.stopLoginServer()
+        os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+        self.loginServerInstance = LoginServer(port, self.onLoginServerRedirect)
+        self.loginServerThread = threading.Thread(target=self.loginServerInstance.serve_forever)
+        self.loginServerThread.start()
+        port = self.loginServerInstance.server_port
+        self.defaults['redirect_uri'] = 'http://localhost:%d' % port
+        self.logMessage('Login server listening at http://localhost:%d.' % port)
+
+    @Slot()
+    def stopLoginServer(self):
+        if self.loginServerInstance is not None:
+            self.loginServerInstance.shutdown()
+            self.logMessage('Login server stopped.')
+            self.loginServerInstance = None
+
+    def onLoginServerRedirect(self, path):
+        options = self.getOptions()
+        url = options['redirect_uri'] + path
+        if self.getOAuth2Token(url):
+            self.stopLoginServer()
+            return "https://strohne.github.io/Facepager/oauth_feedback.html"
+        else:
+            return None
+
+    @Slot()
+    def initSession(self, no=0, renew=False):
+        """
+        Dispatch session initialization to specialized functions
+        :param no: session number
+        :return: session object
+        """
+        options = self.getOptions()
+
+        if options.get('auth_type') == 'OAuth1':
+            return self.initOAuth1Session(no, renew)
+        else:
+            return self.initOAuth2Session(no, renew)
+
+    def initOAuth1Session(self,no=0, renew=False):
+        """
+        Return session or create if necessary
+        :param no: session number
+        :return: session object
+        """
+
+        while (len(self.sessions) <= no):
+            self.sessions.append(None)
+
+        session = self.sessions[no] if not renew else None
+        if session is None:
+            if (self.tokenEdit.text() == '') or (self.tokensecretEdit.text() == ''):
+                raise Exception("No access, login please!")
+
+            service = self.getOAuth1Service()
+            session = service.get_session((self.tokenEdit.text(), self.tokensecretEdit.text()))
+
+        self.sessions[no] = session
+        return session
+
+    def initOAuth2Session(self, no=0, renew=False):
+        return super(AuthTab, self).initSession(no, renew)
+
+    def getOAuth1Service(self):
+        if not hasattr(self,'oauthdata'):
+            self.oauthdata = {}
+
+        service = OAuth1Service(
+            consumer_key=self.defaults.get('client_id'),
+            consumer_secret=self.defaults.get('client_secret'),
+            name='oauth1',
+            access_token_url=self.defaults.get('access_token_url'),
+            authorize_url=self.defaults.get('authorize_url'),
+            request_token_url=self.defaults.get('request_token_url'),
+            base_url=self.defaults.get('basepath'))
+
+        # clientid = self.getClientId()
+        # if clientid is None:
+        #     return None
+
+        service.consumer_key = self.clientIdEdit.text() if self.clientIdEdit.text() != "" else \
+            self.defaults['client_id']
+        service.consumer_secret = self.clientSecretEdit.text() if self.clientSecretEdit.text() != "" else \
+            self.defaults['client_secret']
+        service.base_url = self.basepathEdit.currentText().strip() if self.basepathEdit.currentText().strip() != "" else \
+            self.defaults['basepath']
+
+        if service.consumer_key == '':
+            raise Exception('Consumer key is missing, please adjust settings!')
+        if service.consumer_secret == '':
+            raise Exception('Consumer secret is missing, please adjust settings!')
+
+        return service
+
+
+    def getOAuth1Token(self, url):
+        success = False
+        url = urllib.parse.parse_qs(url)
+        if "oauth_verifier" in url:
+            token = url["oauth_verifier"]
+            if token:
+                service = self.getOAuth1Service()
+                self.oauthdata['oauth_verifier'] = token[0]
+
+                session = service.get_auth_session(self.oauthdata['requesttoken'],
+                                                   self.oauthdata['requesttoken_secret'], method="POST",
+                                                   data={'oauth_verifier': self.oauthdata['oauth_verifier']})
+
+                # Get user ID
+                if self.auth_preregistered:
+                    userid = self.getUserId(session)
+                    if userid is None:
+                        raise Exception("Could not retrieve user ID. Check settings and try again.")
+
+                    self.authorizeUser(userid)
+                    if not self.auth_userauthorized:
+                        raise Exception("You are not registered at Facepager.")
+
+                self.tokenEdit.setText(session.access_token)
+                self.tokensecretEdit.setText(session.access_token_secret)
+
+                session.close()
+                success = True
+        return success
+
+
+    def getOAuth2Token(self, url):
+        success = False
+        try:
+            options = self.getOptions()
+
+            urlparsed = urlparse(url)
+            query = parse_qs(urlparsed.query)
+
+            if url.startswith(options['redirect_uri']) and query.get('code') is not None:
+                try:
+                    clientid = self.clientIdEdit.text() if self.clientIdEdit.text() != "" \
+                        else self.defaults.get('client_id', '')
+                    clientsecret = self.clientSecretEdit.text() if self.clientSecretEdit.text() != "" \
+                        else self.defaults.get('client_secret', '')
+                    scope = self.scopeEdit.text() if self.scopeEdit.text() != "" else \
+                        self.defaults.get('scope', None)
+
+                    headers = options.get("headers",{})
+                    headers = {key.lower(): value for (key, value) in headers.items()}
+
+                    session = OAuth2Session(clientid, redirect_uri=options['redirect_uri'], scope=scope)
+                    token = session.fetch_token(
+                        options['token_uri'],
+                        authorization_response=str(url),
+                        client_secret=clientsecret,
+                        headers=headers
+                    )
+
+                    # Get user ID
+                    if self.auth_preregistered:
+                        userid = self.getUserId(token.get('access_token',''))
+                        if userid is None:
+                            raise Exception("Could not retrieve user ID. Check settings and try again.")
+
+                        self.authorizeUser(userid)
+                        if not self.auth_userauthorized:
+                            raise Exception("You are not registered at Facepager.")
+
+                    self.tokenEdit.setText(token.get('access_token',''))
+
+                    try:
+                        self.authEdit.setCurrentIndex(self.authEdit.findText('header'))
+                    except AttributeError:
+                        pass
+
+                    success = True
+                finally:
+                    session.close()
+            elif url.startswith(options['redirect_uri']) and query.get('error') is not None:
+                self.logMessage(f"Login error: {query.get('error')}")
+
+        except Exception as e:
+            self.logMessage(e)
+
+        return success
+
+    # Get Client ID
+    # return custom client ID if provided
+    # otherwise login to Facepager and return preregistered ID
+    # or return None if login fails
+    def getClientId(self):
+        if self.clientIdEdit.text() != "":
+            self.auth_preregistered = False
+            clientid = self.clientIdEdit.text()
+        else:
+            self.auth_preregistered = True
+            clientid = self.defaults.get('client_id', '')
+
+            if clientid == '':
+                raise Exception('Client ID missing, please adjust settings!')
+
+            termsurl = self.defaults.get('termsurl', '')
+            if termsurl != '':
+                proceedDlg = PreLoginWebDialog(self.mainWindow, "Login to Facepager", termsurl)
+                if proceedDlg.show() != QDialog.Accepted:
+                    return None
+
+        return clientid
+
+    # Retrieves a user ID from the API that
+    # later is hashed for maintaining the
+    # anonymized user list. REimplement in the modules.
+    def getUserId(self):
+        return None
+
+    def authorizeUser(self, userid):
+        # User ID
+        if userid is None:
+            self.auth_userauthorized = False
+            return False
+
+        # App salt
+        salt = getDictValueOrNone(credentials,'facepager.salt')
+        if salt is None:
+            self.auth_userauthorized = False
+            return False
+
+        # Create token
+        usertoken = hashlib.pbkdf2_hmac(
+            'sha256',  # The hash digest algorithm for HMAC
+            userid.encode("utf-8"),
+            salt.encode("utf-8"),
+            100000  # It is recommended to use at least 100,000 iterations of SHA-256
+        )
+
+        # Check token
+        authurl = getDictValueOrNone(credentials, 'facepager.url')
+        if authurl is None:
+            self.auth_userauthorized = False
+            return False
+
+        authurl += '?module='+self.name.lower()+'&usertoken='+usertoken.hex()
+        session = self.initOAuth2Session(0, True)
+        data, headers, status = self.request(0, authurl)
+        self.closeSession(0)
+        self.auth_userauthorized = status == 'fetched (200)'
+
+        return self.auth_userauthorized
+
+
+class GenericTab(AuthTab):
+    def __init__(self, mainWindow=None):
+        super(GenericTab, self).__init__(mainWindow, "Generic")
+
+        #Defaults
+        self.timeout = 60
+        self.defaults['basepath'] = '<Object ID>'
+
+        # Standard inputs
+        self.initInputs()
+
+        # Header, Verbs
+        self.initHeaderInputs()
+        self.initVerbInputs()
+        self.initUploadFolderInput()
+
+        # Extract input
+        self.initPagingInputs(True)
+        self.initResponseInputs(True)
+
+        self.initFileInputs()
+
+        # Login inputs
+        self.initAuthSetupInputs()
+        self.initLoginInputs()
+
+        self.loadDoc()
+        self.loadSettings()
+
+
+    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(GenericTab, self).getOptions(purpose)
+
+        if purpose != 'preset':
+            options['querytype'] = self.name + ':'+options['basepath']+options['resource']
+
+        return options
+
+    # def onSslErrors(self, reply, errors):
+    #     url = str(reply.url().toString())
+    #     reply.ignoreSslErrors()
+    #     self.logmessage.emit("SSL certificate error ignored: %s (Warning: Your connection might be insecure!)" % url)
+
+
 class FacebookTab(AuthTab):
     def __init__(self, mainWindow=None):
         super(FacebookTab, self).__init__(mainWindow, "Facebook")
 
+        # Authorization
+        self.auth_userauthorized = False
+
         #Defaults
+        self.defaults['auth_type'] = "OAuth2"
         self.defaults['scope'] = '' #user_groups
-        self.defaults['basepath'] = 'https://graph.facebook.com/v3.12'
+        self.defaults['basepath'] = 'https://graph.facebook.com/v3.2'
         self.defaults['resource'] = '/<Object ID>'
         self.defaults['auth_uri'] = 'https://www.facebook.com/dialog/oauth'
         self.defaults['redirect_uri'] = 'https://www.facebook.com/connect/login_success.html'
-
-        self.defaults['auth'] = 'param'
-        self.defaults['auth_tokenname'] = 'access_token'
 
         self.defaults['login_buttoncaption'] = " Login to Facebook "
 
@@ -1950,6 +2457,10 @@ class FacebookTab(AuthTab):
     def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
         options = super(FacebookTab, self).getOptions(purpose)
 
+        options['auth'] = 'param'
+        options['auth_prefix'] = ''
+        options['auth_tokenname'] = 'access_token'
+
         if purpose != 'preset':
             options['pageid'] = self.pageIdEdit.text().strip()
 
@@ -1963,10 +2474,16 @@ class FacebookTab(AuthTab):
 
     def fetchData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
         # Preconditions
+        if not self.auth_userauthorized and self.auth_preregistered:
+            raise Exception('You are not authorized, login please!')
+
         if options.get('access_token','') == '':
             raise Exception('Access token is missing, login please!')
+
         self.connected = True
         self.speed = options.get('speed',None)
+        self.timeout = options.get('timeout', 15)
+        self.maxsize = options.get('maxsize', 5)
         session_no = options.get('threadnumber', 0)
 
         # Init pagination
@@ -1988,8 +2505,7 @@ class FacebookTab(AuthTab):
             method, urlpath, urlparams, payload, requestheaders = self.buildUrl(nodedata, options, logProgress)
 
             if options['logrequests']:
-                logpath = urlpath + "?" + urllib.parse.urlencode(urlparams).replace( \
-                    options.get('access_token',''),'')
+                logpath = self.getLogURL(urlpath, urlparams, options)
                 logMessage("Fetching data for {0} from {1}".format(nodedata['objectid'], logpath))
 
             # data
@@ -2016,6 +2532,8 @@ class FacebookTab(AuthTab):
                 # see https://developers.facebook.com/docs/graph-api/advanced/rate-limiting/
                 if (code in ['4','17','32','613']) and (status in ['error (400)', 'error (403)']):
                     options['ratelimit'] = True
+                else:
+                    options['ratelimit'] = False
 
             # fallback option for data handling
             if (options.get('nodedata') is None):
@@ -2046,300 +2564,61 @@ class FacebookTab(AuthTab):
     def doLogin(self, session_no = 0):
         try:
             #use credentials from input if provided
-            clientid = self.clientIdEdit.text() if self.clientIdEdit.text() != "" else self.defaults.get('client_id','')
+            clientid = self.getClientId()
+            if clientid is None:
+                return False
             scope= self.scopeEdit.text() if self.scopeEdit.text() != "" else self.defaults.get('scope','')
             
-            if clientid  == '':
-                 raise Exception('Client ID missing, please adjust settings!')
-            
+
             url = self.defaults['auth_uri'] +"?client_id=" + clientid + "&redirect_uri="+self.defaults['redirect_uri']+"&response_type=token&scope="+scope+"&display=popup"
             caption = "Facebook Login Page"
             self.showLoginWindow(caption, url)
         except Exception as e:
             QMessageBox.critical(self, "Login canceled",str(e),QMessageBox.StandardButton.Ok)
 
+    def getUserId(self, token):
+        data, headers, status = self.request(
+            None, self.basepathEdit.currentText().strip() +
+                  '/me?fields=id&access_token=' + token)
+        if status != 'fetched (200)':
+            return None
+
+        return data.get('id')
+
     @Slot(QUrl)
-    def getToken(self,url):
-        if url.toString().startswith(self.defaults['redirect_uri']):
+    def onLoginWindowChanged(self, url):
+        if "#access_token" in url.toString():
             try:
-                url = urllib.parse.parse_qs(url.toString())
-                token = url.get(self.defaults['redirect_uri']+"#access_token",[''])
-                self.tokenEdit.setText(token[0])
+                url = urllib.parse.urlparse(url.toString(),allow_fragments=True)
+                fragment = urllib.parse.parse_qs(url.fragment)
+                token = fragment.get('access_token').pop()
+
+                # Get user ID
+                if self.auth_preregistered:
+                    userid = self.getUserId(token)
+                    if userid is None:
+                        raise Exception("Could not retrieve user ID. Check settings and try again.")
+
+                    self.authorizeUser(userid)
+                    if not self.auth_userauthorized:
+                        raise Exception("You are not registered at Facepager.")
 
                 # Get page access token
                 pageid = self.pageIdEdit.text().strip()
-                if  pageid != '':
-                    session_no = 0
-                    self.closeSession(session_no)
-                    data, headers, status = self.request(session_no, self.basepathEdit.currentText().strip()+'/'+pageid+'?fields=access_token&scope=pages_show_list&access_token='+token[0])
+                if pageid != '':
+                    data, headers, status = self.request(None, self.basepathEdit.currentText().strip()+'/'+pageid+'?fields=access_token&scope=pages_show_list&access_token='+token)
                     if status != 'fetched (200)':
                         raise Exception("Could not authorize for page. Check page ID in the settings.")
 
-                    token = data['access_token']
-                    self.tokenEdit.setText(token)
+                    token = data.get('access_token','')
 
-                else:
-                    self.tokenEdit.setText(token[0])
+                # Set token
+                self.tokenEdit.setText(token)
             except Exception as e:
                 QMessageBox.critical(self,"Login error",
                                      str(e),QMessageBox.StandardButton.Ok)
             self.closeLoginWindow()
 
-
-class TwitterStreamingTab(ApiTab):
-    def __init__(self, mainWindow=None):
-        super(TwitterStreamingTab, self).__init__(mainWindow, "Twitter Streaming")
-
-        self.defaults['access_token_url'] = 'https://api.twitter.com/oauth/access_token'
-        self.defaults['authorize_url'] = 'https://api.twitter.com/oauth/authorize'
-        self.defaults['request_token_url'] = 'https://api.twitter.com/oauth/request_token'
-        self.defaults['basepath'] = 'https://stream.twitter.com/1.1'
-        self.defaults['resource'] = '/statuses/filter'
-        self.defaults['params'] = {'track': '<Object ID>'}        
-
-        self.defaults['key_objectid'] = 'id'
-        self.defaults['key_nodedata'] = None
-
-        # Query Box
-        self.initInputs()
-        self.initAuthSettingsInputs()
-        self.initLoginInputs()
-
-        self.loadDoc()
-        self.loadSettings()
-
-        self.timeout = 30
-        self.connected = False
-
-    def getOAuth1Service(self):
-        if not hasattr(self, 'oauthdata'):
-            self.oauthdata = {}
-
-        service = OAuth1Service(
-            consumer_key=self.defaults.get('consumer_key'),
-            consumer_secret=self.defaults.get('consumer_secret'),
-            name='twitterstreaming',
-            access_token_url=self.defaults.get('access_token_url'),
-            authorize_url=self.defaults.get('authorize_url'),
-            request_token_url=self.defaults.get('request_token_url'),
-            base_url=self.defaults.get('basepath'))
-
-        service.consumer_key = self.consumerKeyEdit.text() if self.consumerKeyEdit.text() != "" \
-            else self.defaults['consumer_key']
-        service.consumer_secret = self.consumerSecretEdit.text() if self.consumerSecretEdit.text() != "" \
-            else self.defaults['consumer_secret']
-
-        if service.consumer_key == '' or service.consumer_secret == '':
-            raise Exception('Consumer key or consumer secret is missing, please adjust settings!')
-
-        return service
-
-
-    def initLoginInputs(self):
-        # Login-Boxes
-        loginlayout = QHBoxLayout()
-
-        self.tokenEdit = QLineEdit()
-        self.tokenEdit.setEchoMode(QLineEdit.Password)
-        loginlayout.addWidget(self.tokenEdit)
-
-        loginlayout.addWidget(QLabel("Access Token Secret"))
-        self.tokensecretEdit = QLineEdit()
-        self.tokensecretEdit.setEchoMode(QLineEdit.Password)
-        loginlayout.addWidget(self.tokensecretEdit)
-
-        self.authButton = QPushButton('Settings', self)
-        self.authButton.clicked.connect(self.editAuthSettings)
-        loginlayout.addWidget(self.authButton)
-
-        self.loginButton = QPushButton(" Login to Twitter ", self)
-        self.loginButton.clicked.connect(self.doLogin)
-        loginlayout.addWidget(self.loginButton)
-
-        # Add to main-Layout
-        self.extraLayout.addRow("Access Token", loginlayout)
-
-
-    def initAuthSettingsInputs(self):
-        authlayout = QFormLayout()
-        authlayout.setContentsMargins(0,0,0,0)
-        self.authWidget.setLayout(authlayout)
-
-        self.consumerKeyEdit = QLineEdit()
-        self.consumerKeyEdit.setEchoMode(QLineEdit.Password)
-        authlayout.addRow("Consumer Key", self.consumerKeyEdit)
-
-        self.consumerSecretEdit = QLineEdit()
-        self.consumerSecretEdit.setEchoMode(QLineEdit.Password)
-        authlayout.addRow("Consumer Secret",self.consumerSecretEdit)
-
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(TwitterStreamingTab, self).getOptions(purpose)
-        return options
-    
-    def initSession(self, no=0, renew=False):
-        """
-        Return session or create if necessary
-        :param no: session number
-        :return: session object
-        """
-
-        while (len(self.sessions) <= no):
-            self.sessions.append(None)
-
-        session = self.sessions[no] if not renew else None
-        if session is None:
-            service = self.getOAuth1Service()
-            if (self.tokenEdit.text() != '') and (self.tokensecretEdit.text() != ''):
-                session = service.get_session((self.tokenEdit.text(), self.tokensecretEdit.text()))
-
-        if session is None:
-            raise Exception("No access, login please!")
-
-        self.sessions[no] = session
-        return session
-
-
-    def request(self, session_no=0, path='', args=None, headers=None):
-        self.connected = True
-        self.retry_counter=0
-        self.last_reconnect=QDateTime.currentDateTime()
-        try:
-            session = self.initSession(session_no)
-
-            def _send():
-                self.last_reconnect = QDateTime.currentDateTime()
-                while self.connected:
-                    try:
-                        if headers is not None:
-                            response = session.post(path, params=args,
-                                                         headers=headers,
-                                                         timeout=self.timeout,
-                                                         stream=True)
-                        else:
-                            response = session.get(path, params=args, timeout=self.timeout,
-                                                        stream=True)
-
-                    except requests.exceptions.Timeout:
-                        raise Exception('Request timed out.')
-                    else:
-                        if response.status_code != 200:
-                            if self.retry_counter<=5:
-                                self.logMessage("Reconnecting in 3 Seconds: " + str(response.status_code) + ". Message: "+ str(response.content))
-                                time.sleep(3)
-                                if self.last_reconnect.secsTo(QDateTime.currentDateTime())>120:
-                                    self.retry_counter = 0
-                                    _send()
-                                else:
-                                    self.retry_counter+=1
-                                    _send()
-                            else:
-                                #self.connected = False
-                                self.disconnectSocket()
-                                raise Exception("Request Error: " + str(response.status_code) + ". Message: "+str(response.content))
-
-                        return response
-
-
-            while self.connected:
-                response = _send()
-                if response:
-                    status = 'fetched' if response.ok else 'error'
-                    status = status + ' (' + str(response.status_code) + ')'
-                    headers = dict(list(response.headers.items()))
-
-                    for line in response.iter_lines():
-                        if not self.connected:
-                            break
-                        if line:
-                            try:
-                                data = json.loads(line)
-                            except ValueError:  # pragma: no cover
-                                raise Exception("Unable to decode response, not valid JSON")
-                            else:
-                                yield data, headers, status
-                else:
-                    break
-            response.close()
-
-        except AttributeError:
-            #This exception is thrown when canceling the connection
-            #Only re-raise if not manually canceled
-            if self.connected:
-                raise
-        finally:
-            self.connected = False
-
-    def disconnectSocket(self):
-        """Used to hardly disconnect the streaming client"""
-        self.connected = False
-        while (len(self.sessions) > 0):
-            session = self.sessions.pop()
-            session.close()
-
-        #self.response.raw._fp.close()
-        #self.response.close()
-
-    def fetchData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
-        if not ('url' in options):
-            urlpath = options["basepath"] + options["resource"] + ".json"
-            urlpath, urlparams, templateparams = self.getURL(urlpath, options["params"], nodedata,options)
-        else:
-            urlpath = options['url']
-            urlparams = options["params"]
-
-        if options['logrequests']:
-            logpath = urlpath + "?" + urllib.parse.urlencode(urlparams).replace( \
-                options.get('access_token', ''), '')
-            logMessage("Fetching data for {0} from {1}".format(nodedata['objectid'], logpath))
-
-        # fallback option for data handling
-        if (options.get('nodedata') is None):
-            options['nodedata'] = self.defaults.get('key_nodedata')
-        if (options.get('objectid') is None):
-            options['objectid'] = self.defaults.get('key_objectid')
-
-        # data
-        session_no = options.get('threadnumber',0)
-        for data, headers, status in self.request(session_no, path=urlpath, args=urlparams):
-            # data
-            options['querytime'] = str(datetime.now())
-            options['querystatus'] = status
-
-            logData(data, options, headers)
-
-
-    @Slot()
-    def doLogin(self, session_no=0):
-        try:
-            service = self.getOAuth1Service()
-
-            self.oauthdata.pop('oauth_verifier', None)
-            self.oauthdata['requesttoken'], self.oauthdata['requesttoken_secret'] = service.get_request_token()
-            caption = "Twitter Login Page"
-            self.showLoginWindow(caption,service.get_authorize_url(self.oauthdata['requesttoken']))
-        except Exception as e:
-            QMessageBox.critical(self, "Login canceled",
-                                            str(e),
-                                            QMessageBox.StandardButton.Ok)
-
-    @Slot()
-    def getToken(self):
-        url = urllib.parse.parse_qs(self.login_webview.url().toString())
-        if 'oauth_verifier' in url:
-            token = url['oauth_verifier']
-            if token:
-                service = self.getOAuth1Service()
-                self.oauthdata['oauth_verifier'] = token[0]
-                session = service.get_auth_session(self.oauthdata['requesttoken'],
-                                                             self.oauthdata['requesttoken_secret'], method='POST',
-                                                             data={'oauth_verifier': self.oauthdata['oauth_verifier']})
-
-                self.tokenEdit.setText(session.access_token)
-                self.tokensecretEdit.setText(session.access_token_secret)
-
-                session.close()
-                self.closeLoginWindow()
 
 class AmazonTab(AuthTab):
 
@@ -2360,10 +2639,10 @@ class AmazonTab(AuthTab):
         self.initUploadFolderInput()
 
         # Extract input
-        self.initResponseInputs()
+        self.initResponseInputs(True)
 
         # Pages Box
-        self.initPagingInputs(True, True)
+        self.initPagingInputs(True)
 
         # Login inputs
         self.initLoginInputs()
@@ -2401,7 +2680,8 @@ class AmazonTab(AuthTab):
     def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
         options = super(AmazonTab, self).getOptions(purpose)
 
-        options['format'] = self.defaults.get('format', '')
+        options['auth'] = 'disable'
+        #options['format'] = self.defaults.get('format', '')
         options['service'] = self.serviceEdit.text().strip() if self.serviceEdit.text() != "" else self.defaults.get('service', '')
         options['region'] = self.regionEdit.text().strip() if self.regionEdit.text() != "" else self.defaults.get(
             'region', '')
@@ -2541,12 +2821,16 @@ class TwitterTab(AuthTab):
     def __init__(self, mainWindow=None):
         super(TwitterTab, self).__init__(mainWindow, "Twitter")
 
+        # Authorization
+        self.auth_userauthorized = False
+
         # Defaults
         self.defaults['basepath'] = 'https://api.twitter.com/1.1'
         self.defaults['resource'] = '/search/tweets'
         self.defaults['params'] = {'q': '<Object ID>'}
+        #self.defaults['extension'] = ".json"
 
-        self.defaults['auth_type'] = 'Twitter OAuth1'
+        self.defaults['auth_type'] = 'OAuth1'
         self.defaults['access_token_url'] = 'https://api.twitter.com/oauth/access_token'
         self.defaults['authorize_url'] = 'https://api.twitter.com/oauth/authorize'
         self.defaults['request_token_url'] = 'https://api.twitter.com/oauth/request_token'
@@ -2593,7 +2877,7 @@ class TwitterTab(AuthTab):
         self.authWidget.setLayout(authlayout)
 
         self.authTypeEdit= QComboBox()
-        self.authTypeEdit.addItems(['Twitter OAuth1', 'Twitter App-only'])
+        self.authTypeEdit.addItems(['OAuth1', 'OAuth2 Client Credentials'])
         authlayout.addRow("Authentication type", self.authTypeEdit)
 
         self.clientIdEdit = QLineEdit()
@@ -2604,9 +2888,32 @@ class TwitterTab(AuthTab):
         self.clientSecretEdit.setEchoMode(QLineEdit.Password)
         authlayout.addRow("Consumer Secret", self.clientSecretEdit)
 
+    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(TwitterTab, self).getOptions(purpose)
+
+        if options['auth_type'] == 'OAuth2 Client Credentials':
+            options['auth_uri'] = 'https://api.twitter.com/oauth2/token/'
+
+        return options
+
+    def getUserId(self, session):
+        # Send request
+        response = session.request('GET', 'https://api.twitter.com/1.1/account/settings.json', timeout=self.timeout)
+        if not response.ok :
+             return None
+
+        data = response.json() if response.text != '' else []
+        return getDictValueOrNone(data, 'screen_name')
+
     def fetchData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
+        # Preconditions
+        if not self.auth_userauthorized and self.auth_preregistered:
+            raise Exception('You are not authorized, login please!')
+
         self.connected = True
         self.speed = options.get('speed', None)
+        self.timeout = options.get('timeout', 15)
+        self.maxsize = options.get('maxsize', 5)
         session_no = options.get('threadnumber',0)
 
         # Init pagination
@@ -2619,12 +2926,10 @@ class TwitterTab(AuthTab):
             options = deepcopy(options)
             options['currentpage'] = page
 
-            options['pathextension'] = ".json"
             method, urlpath, urlparams, payload, requestheaders = self.buildUrl(nodedata, options, logProgress)
 
             if options['logrequests']:
-                logpath = urlpath + "?" + urllib.parse.urlencode(urlparams).replace( \
-                    options.get('access_token', ''), '')
+                logpath = self.getLogURL(urlpath, urlparams, options)
                 logMessage("Fetching data for {0} from {1}".format(nodedata['objectid'], logpath))
 
             # data
@@ -2674,16 +2979,158 @@ class TwitterTab(AuthTab):
             if not self.connected:
                 break
 
+
+
+class TwitterStreamingTab(TwitterTab):
+    def __init__(self, mainWindow=None):
+        super(TwitterTab, self).__init__(mainWindow, "Twitter Streaming")
+
+        # Authorization
+        self.auth_userauthorized = False
+
+        self.defaults['auth_type'] = 'OAuth1'
+        self.defaults['access_token_url'] = 'https://api.twitter.com/oauth/access_token'
+        self.defaults['authorize_url'] = 'https://api.twitter.com/oauth/authorize'
+        self.defaults['request_token_url'] = 'https://api.twitter.com/oauth/request_token'
+        self.defaults['login_window_caption'] = 'Twitter Login Page'
+
+        self.defaults['basepath'] = 'https://stream.twitter.com/1.1'
+        self.defaults['resource'] = '/statuses/filter'
+        self.defaults['params'] = {'track': '<Object ID>'}
+        #self.defaults['extension'] = ".json"
+
+        self.defaults['key_objectid'] = 'id'
+        self.defaults['key_nodedata'] = None
+
+        # Query Box
+        self.initInputs()
+        self.initAuthSetupInputs()
+        self.initLoginInputs()
+
+        self.loadDoc()
+        self.loadSettings()
+
+        self.timeout = 30
+        self.connected = False
+
+    def stream(self, session_no=0, path='', args=None, headers=None):
+        self.connected = True
+        self.retry_counter=0
+        self.last_reconnect=QDateTime.currentDateTime()
+        try:
+            session = self.initSession(session_no)
+
+            def _send():
+                self.last_reconnect = QDateTime.currentDateTime()
+                while self.connected:
+                    try:
+                        if headers is not None:
+                            response = session.post(path, params=args,
+                                                         headers=headers,
+                                                         timeout=self.timeout,
+                                                         stream=True)
+                        else:
+                            response = session.get(path, params=args, timeout=self.timeout,
+                                                        stream=True)
+
+                    except requests.exceptions.Timeout:
+                        raise Exception('Request timed out.')
+                    else:
+                        if response.status_code != 200:
+                            if self.retry_counter<=5:
+                                self.logMessage("Reconnecting in 3 Seconds: " + str(response.status_code) + ". Message: "+ str(response.content))
+                                time.sleep(3)
+                                if self.last_reconnect.secsTo(QDateTime.currentDateTime())>120:
+                                    self.retry_counter = 0
+                                    _send()
+                                else:
+                                    self.retry_counter+=1
+                                    _send()
+                            else:
+                                #self.connected = False
+                                self.disconnectSocket()
+                                raise Exception("Request Error: " + str(response.status_code) + ". Message: "+str(response.content))
+
+                        return response
+
+
+            while self.connected:
+                response = _send()
+                if response:
+                    status = 'fetched' if response.ok else 'error'
+                    status = status + ' (' + str(response.status_code) + ')'
+                    headers = dict(list(response.headers.items()))
+
+                    for line in response.iter_lines():
+                        if not self.connected:
+                            break
+                        if line:
+                            try:
+                                data = json.loads(line)
+                            except ValueError:  # pragma: no cover
+                                raise Exception("Unable to decode response, not valid JSON")
+                            else:
+                                yield data, headers, status
+                else:
+                    break
+            response.close()
+
+        except AttributeError:
+            #This exception is thrown when canceling the connection
+            #Only re-raise if not manually canceled
+            if self.connected:
+                raise
+        finally:
+            self.connected = False
+
+    def fetchData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
+        # Preconditions
+        if not self.auth_userauthorized and self.auth_preregistered:
+            raise Exception('You are not authorized, login please!')
+
+        if not ('url' in options):
+            urlpath = options["basepath"] + options["resource"] + options.get('extension', '')
+            urlpath, urlparams, templateparams = self.getURL(urlpath, options["params"], nodedata, options)
+        else:
+            urlpath = options['url']
+            urlparams = options["params"]
+
+        if options['logrequests']:
+            logpath = self.getLogURL(urlpath, urlparams, options)
+            logMessage("Fetching data for {0} from {1}".format(nodedata['objectid'], logpath))
+
+        # fallback option for data handling
+        if (options.get('nodedata') is None):
+            options['nodedata'] = self.defaults.get('key_nodedata')
+        if (options.get('objectid') is None):
+            options['objectid'] = self.defaults.get('key_objectid')
+
+        self.timeout = options.get('timeout',30)
+        self.maxsize = options.get('maxsize', 5)
+
+        # data
+        session_no = options.get('threadnumber',0)
+        for data, headers, status in self.stream(session_no, path=urlpath, args=urlparams):
+            # data
+            options['querytime'] = str(datetime.now())
+            options['querystatus'] = status
+
+            logData(data, options, headers)
+
 class YoutubeTab(AuthTab):
     def __init__(self, mainWindow=None):
 
         super(YoutubeTab, self).__init__(mainWindow, "YouTube")
 
+        # Authorization
+        self.auth_userauthorized = False
+
         # Defaults
+        self.defaults['auth_type'] = "OAuth2 External"
         self.defaults['auth_uri'] = 'https://accounts.google.com/o/oauth2/auth'
         self.defaults['token_uri'] = "https://accounts.google.com/o/oauth2/token"
-        self.defaults['redirect_uri'] = 'https://localhost' #"urn:ietf:wg:oauth:2.0:oob" #, "http://localhost"
-        self.defaults['scope'] = "https://www.googleapis.com/auth/youtube.readonly" #,"https://www.googleapis.com/auth/youtube.force-ssl"
+        self.defaults['redirect_uri'] = 'https://localhost'
+        self.defaults['scope'] = "https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.force-ssl"
         self.defaults['response_type'] = "code"
 
         self.defaults['login_buttoncaption'] = " Login to Google "
@@ -2713,7 +3160,7 @@ class YoutubeTab(AuthTab):
         self.authWidget.setLayout(authlayout)
 
         self.authTypeEdit= QComboBox()
-        self.authTypeEdit.addItems(['OAuth2', 'API key'])
+        self.authTypeEdit.addItems(['OAuth2', 'OAuth2 External','API key'])
         authlayout.addRow("Authentication type", self.authTypeEdit)
 
         self.clientIdEdit = QLineEdit()
@@ -2727,162 +3174,28 @@ class YoutubeTab(AuthTab):
         self.scopeEdit = QLineEdit()
         authlayout.addRow("Scopes",self.scopeEdit)
 
+    def getUserId(self, token):
+        data, headers, status = self.request(
+            None, 'https://www.googleapis.com/youtube/v3/channels?mine=true&access_token='+token)
+
+        if status != 'fetched (200)':
+            return None
+
+        return getDictValueOrNone(data,'items.0.id')
+
     def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
         options = super(YoutubeTab, self).getOptions(purpose)
 
-        if options.get('auth_type','OAuth2') == 'API key':
+        if options.get('auth_type') == 'API key':
+            options['auth'] = 'param'
+            options['auth_prefix'] = ''
             options['auth_tokenname'] = 'key'
+        else: # OAuth2
+            options['auth'] = 'header'
+            options['auth_prefix'] = 'Bearer '
+            options['auth_tokenname'] = 'Authorization'
 
         return options
-
-    @Slot()
-    def doLogin(self, session_no=0):
-        if hasattr(self, "authTypeEdit") and self.authTypeEdit.currentText() == 'API key':
-            QMessageBox.information(self, "Facepager", "Manually enter your API key into the access token field or switch to OAuth2")
-        else:
-            super(YoutubeTab, self).doLogin()
-
-class GenericTab(AuthTab):
-    def __init__(self, mainWindow=None):
-        super(GenericTab, self).__init__(mainWindow, "Generic")
-
-        # Standard inputs
-        self.initInputs()
-
-        # Header, Verbs
-        self.initHeaderInputs()
-        self.initVerbInputs()
-        self.initUploadFolderInput()
-
-        # Extract input
-        self.initPagingInputs(True, True)
-        self.initResponseInputs()
-
-        self.initFileInputs()
-
-        # Login inputs
-        self.initAuthSetupInputs()
-        self.initLoginInputs()
-
-        self.loadDoc()
-        self.loadSettings()
-        self.timeout = 15
-
-    def initResponseInputs(self):
-        layout = QHBoxLayout()
-
-        #Format
-        self.formatEdit = QComboBox(self)
-        self.formatEdit.addItems(['json','text','links','file'])
-        self.formatEdit.setToolTip("<p>JSON: default option, data will be parsed as JSON or converted from XML to JSON. </p> \
-                                    <p>Text: data will not be parsed and embedded in JSON. </p> \
-                                    <p>Links: data will be parsed as xml and links will be extracted (set key to extract to 'links' and key for Object ID to 'url'). </p> \
-                                    <p>File: data will only be downloaded to files, specify download folder and filename.</p>")
-        layout.addWidget(self.formatEdit)
-        layout.setStretch(0, 0)
-        #self.formatEdit.currentIndexChanged.connect(self.formatChanged)
-
-        # Extract
-        layout.addWidget(QLabel("Key to extract"))
-        self.extractEdit = QLineEdit(self)
-        self.extractEdit.setToolTip(wraptip("If your data contains a list of objects, set the key of the list. Every list element will be adeded as a single node. Remaining data will be added as offcut node."))
-        layout.addWidget(self.extractEdit)
-        layout.setStretch(1, 0)
-        layout.setStretch(2, 2)
-
-        layout.addWidget(QLabel("Key for Object ID"))
-        self.objectidEdit = QLineEdit(self)
-        self.objectidEdit.setToolTip(wraptip("If your data contains unique IDs for every node, define the corresponding key."))
-        layout.addWidget(self.objectidEdit)
-        layout.setStretch(3, 0)
-        layout.setStretch(4, 2)
-
-        # Add layout
-        self.extraLayout.addRow("Response", layout)
-
-
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(GenericTab, self).getOptions(purpose)
-
-        if purpose != 'preset':
-            options['querytype'] = self.name + ':'+options['basepath']+options['resource']
-
-        return options
-
-class QWebPageCustom(QWebEnginePage):
-    logmessage = Signal(str)
-    urlNotFound = Signal(QUrl)
-    cookieChanged = Signal(str, str)
-
-    def __init__(self, parent):
-        #super(QWebPageCustom, self).__init__(*args, **kwargs)
-        super(QWebPageCustom, self).__init__(parent)
-
-        self.cookiecache = {}
-
-        profile = self.profile()
-        profile.setHttpCacheType(QWebEngineProfile.MemoryHttpCache)
-        profile.clearHttpCache()
-
-        cookies = profile.cookieStore()
-        profile.setPersistentCookiesPolicy(QWebEngineProfile.NoPersistentCookies)
-        cookies.deleteAllCookies()
-        cookies.cookieAdded.connect(self.cookieAdded)
-
-
-    @Slot()
-    def cookieAdded(self, cookie):
-        """
-        Save cookies in cookie jar and emit cookie signal
-        :param cookie:
-        :return:
-        """
-        #value = cookie.toRawForm(QNetworkCookie.NameAndValueOnly).data().decode()
-
-        cookieid = cookie.domain() + cookie.path()
-        domain = cookie.domain().strip(".")
-        name = cookie.name().data().decode()
-        value = cookie.value().data().decode()
-
-        cookies = self.cookiecache.get(cookieid,{})
-        cookies[name] = value
-        self.cookiecache[cookieid] = cookies
-
-        fullcookie = '; '.join(['{}={}'.format(k, v) for k, v in cookies.items()])
-
-        self.cookieChanged.emit(domain, fullcookie)
-
-    def supportsExtension(self, extension):
-        if extension == QWebEnginePage.ErrorPageExtension:
-            return True
-        else:
-            return False
-
-    def extension(self, extension, option=0, output=0):
-        if extension != QWebEnginePage.ErrorPageExtension: return False
-
-        if option.domain == QWebEnginePage.QtNetwork:
-            #msg = "Network error (" + str(option.error) + "): " + option.errorString
-            #self.logmessage.emit(msg)
-            self.urlNotFound.emit(option.url)
-
-        elif option.domain == QWebEnginePage.Http:
-            msg = "HTTP error (" + str(option.error) + "): " + option.errorString
-            self.logmessage.emit(msg)
-
-        elif option.domain == QWebEnginePage.WebKit:
-            msg = "WebKit error (" + str(option.error) + "): " + option.errorString
-            self.logmessage.emit(msg)
-        else:
-            msg = option.errorString
-            self.logmessage.emit(msg)
-
-        return True
-
-    # def onSslErrors(self, reply, errors):
-    #     url = str(reply.url().toString())
-    #     reply.ignoreSslErrors()
-    #     self.logmessage.emit("SSL certificate error ignored: %s (Warning: Your connection might be insecure!)" % url)
 
 
 # https://stackoverflow.com/questions/10123929/python-requests-fetch-a-file-from-a-local-url
@@ -2939,3 +3252,6 @@ class LocalFileAdapter(requests.adapters.BaseAdapter):
 
     def close(self):
         pass
+
+class DataTooBigError(Exception):
+    pass

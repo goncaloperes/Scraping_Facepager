@@ -8,11 +8,12 @@ import lxml.html
 import lxml.etree
 import html
 import urllib.parse
+import tldextract
 from collections import OrderedDict
 from collections import Mapping
 from xmljson import BadgerFish
-
 import io
+import pyjsparser
 
 def getResourceFolder():
     if getattr(sys, 'frozen', False) and (platform.system() != 'Darwin'):
@@ -24,11 +25,22 @@ def getResourceFolder():
 
     return folder
 
+def flattenList(items):
+    value = []
+    for item in items:
+        if type(item) is list:
+            value += item
+        else:
+            value.append(item)
+    return value
+
 def hasDictValue(data,multikey, piped=False):
     try:
-        multikey = multikey.split('|').pop(0) if piped else multikey
+        #multikey = multikey.split('|').pop(0) if piped else multikey
+        name, multikey, pipeline = parseKey(multikey) if piped else (None,multikey,None)
 
-        keys=multikey.split('.',1)
+        #keys=multikey.split('.',1)
+        keys = tokenize_with_escape(multikey, escape='\\', separator='.')
 
         if isinstance(data, Mapping) and keys[0] != '':
 
@@ -101,6 +113,61 @@ def hasValue(data,key):
     else:
         return True
 
+def dict_generator(indict, pre=None):
+    pre = pre[:] if pre else []
+    if isinstance(indict, dict):
+        for key, value in indict.items():
+            if isinstance(value, dict):
+                for d in dict_generator(value,  pre + [key]):
+                    yield d
+            elif isinstance(value, list) or isinstance(value, tuple):
+                for k,v in enumerate(value):
+                    for d in dict_generator(v, pre + [key] + [k]):
+                        yield d
+            else:
+                yield pre + [key, value]
+    else:
+        yield indict
+
+def jsGetValue(value):
+    proptype = value.get('type')
+    if proptype == 'Literal':
+        return value.get('value')
+    elif proptype == 'Identifier':
+        return value.get('name')
+    elif proptype == 'ObjectExpression':
+        propvalues = value.get('properties', {})
+        outvalue = {}
+        for v in propvalues:
+            v = jsGetValue(v)
+            if isinstance(v, dict):
+                outvalue.update(v)
+        return outvalue
+    elif proptype == 'ArrayExpression':
+        propvalues = value.get('elements', {})
+        return [jsGetValue(v) for v in propvalues]
+    elif proptype == 'Property':
+        propname = jsGetValue(value.get('key',{}))
+        propvalue = jsGetValue(value.get('value', {}))
+        return {propname: propvalue}
+    else:
+        return None
+
+def jsWalkValues(indict, pre=None):
+    pre = pre[:] if pre else []
+    if isinstance(indict, dict):
+        proptype = indict.get('type')
+        if proptype == 'ObjectExpression':
+            yield jsGetValue(indict)
+
+        for key, value in indict.items():
+            if isinstance(value, dict):
+                for d in jsWalkValues(value,  pre + [key]):
+                    yield d
+            elif isinstance(value, list) or isinstance(value, tuple):
+                for k, v in enumerate(value):
+                    for d in jsWalkValues(v, pre + [key] + [k]):
+                        yield d
 
 def extractValue(data, key, dump=True, folder="", default=''):
     """Extract value from dict and pipe through modifiers
@@ -109,6 +176,7 @@ def extractValue(data, key, dump=True, folder="", default=''):
     :param dump:
     :return:
     """
+    #global jsparser
     try:
         # Parse key
         name, key, pipeline = parseKey(key)
@@ -119,24 +187,42 @@ def extractValue(data, key, dump=True, folder="", default=''):
         for idx, modifier in enumerate(pipeline):
             value = value if type(value) is list else [value]
 
-            if modifier.startswith('json:'):
+            if modifier.startswith('js:'):
+                # Input: list of strings.
+                # Output if dump==True: list of strings
+                # Output if dump==False: list of dict, list, string or number
+                selector = modifier[3:]
+
+                items = []
+                for x in value:
+                    try:
+                        #x = x.replace('\\\\"', '\\"')
+
+                        tree = pyjsparser.parse(x)
+                        items += jsWalkValues(tree)
+                    except Exception as e:
+                        items.append({'error':str(e)})
+
+                items = [getDictValue(x, selector, dump=dump, default=[]) for x in items]
+
+                # Flatten list if not dumped
+                if not dump:
+                    value = flattenList(items)
+                else:
+                    value = items
+
+            elif modifier.startswith('json:'):
                 # Input: list of strings.
                 # Output if dump==True: list of strings
                 # Output if dump==False: list of dict, list, string or number
                 selector = modifier[5:]
-
+                items = [getDictValue(json.loads(x), selector, dump=dump) for x in value]
 
                 # Flatten list if not dumped
-                if dump:
-                    value = [getDictValue(json.loads(x), selector, dump=dump) for x in value]
+                if not dump:
+                    value = flattenList(items)
                 else:
-                    items = [getDictValue(json.loads(x), selector, dump=dump) for x in value]
-                    value = []
-                    for item in items:
-                        if type(item) is list:
-                            value += item
-                        else:
-                            value.append(item)
+                    value = items
 
             elif modifier.startswith('not:'):
                 selector = modifier[4:]
@@ -162,6 +248,13 @@ def extractValue(data, key, dump=True, folder="", default=''):
                             value.append(match[0])
                         else:
                             value.append(match)
+
+            # Example: encode:utf-8
+            elif modifier.startswith('encode:'):
+                # Input: list of strings.
+                # Output: list of strings
+                encoding = modifier[7:]
+                value = [x.encode(encoding) for x in value]
 
             elif modifier.startswith('css:'):
                 # Input: list of strings.
@@ -189,7 +282,9 @@ def extractValue(data, key, dump=True, folder="", default=''):
             elif modifier == 'length':
                 value = len(value)
             elif modifier == "timestamp":
-                value = [datetime.fromtimestamp(int(x)).isoformat() for x in value]
+                value = [datetime.utcfromtimestamp(float(x)).isoformat() for x in value]
+            elif modifier == "shortdate":
+                value = [str(datetime.strptime(x, '%a %b %d %H:%M:%S %z %Y')) for x in value]
 
         # If modified in pipeline (otherwise already handled by getDictValue)...
         if dump and (type(value) is dict):
@@ -204,7 +299,90 @@ def extractValue(data, key, dump=True, folder="", default=''):
     except Exception as e:
         return (None, default)
 
-def getDictValue(data, multikey, dump=True, default = ''):
+def findDictValues(data, multikey, dump=True, default=''):
+    """
+    Recursively searches for the multikey
+    :param data:
+    :param multikey:
+    :param dump:
+    :param default:
+    :return:
+    """
+    if hasDictValue(data, multikey):
+        return [getDictValue(data, multikey, dump, default)]
+    elif isinstance(data, Mapping) and multikey != '':
+        values = []
+        for key, value in data,items():
+            values.extend(findDictValues(value, multikey, dump, default))
+        return values
+    elif isinstance(data, list) and multikey != '':
+        values = []
+        for value in data:
+            values.extend(findDictValues(value, multikey, dump, default))
+        return values
+    else:
+        return [default]
+
+def toDictListTuple(data, key=''):
+    """Convert data to a list of tuples shaped (key, dict)."""
+
+    if not (type(data) is list):
+        subkey=0
+        data = [data]
+    else:
+        subkey = key.split('|').pop(0).rsplit('.', 1)[0]
+        key += '.*'
+
+    data = [(key, n if isinstance(n, Mapping) else {subkey: n}) for n in data]
+
+    return data
+
+def sliceData(data, headers=None, options={}):
+    """Filter response data and extract nodes"""
+    if options['nodedata'] is None:
+        nodes = toDictListTuple(data)
+        offcut = None
+    else:
+        keys = options['nodedata'].split(',')
+        nodes = []
+        offcut = data
+
+        for key in keys:
+            if hasDictValue(data, key, piped=True):
+                name, newnodes = extractValue(data, key, False)
+                newnodes = toDictListTuple(newnodes,key)
+
+                nodes.extend(newnodes)
+                offcut = filterDictValue(offcut, key, False, piped=True) \
+                    if options.get('offcut', True) else None
+
+    #empty records
+    if (len(nodes) == 0) and options.get('empty', True):
+        empty = {}
+    else:
+        empty = None
+
+    # offcut
+    if not options.get('offcut', True):
+        offcut = None
+    elif options.get('fulloffcut', False):
+        offcut = data
+
+
+    # headers
+    if not options.get('saveheaders', False):
+        headers = None
+
+    data={
+        'nodes': nodes,
+        'offcut': offcut,
+        'empty': empty,
+        'headers': headers
+    }
+
+    return data
+
+def getDictValue(data, multikey, dump=True, default=''):
     """Extract value from dict
     :param data:
     :param multikey:
@@ -213,7 +391,8 @@ def getDictValue(data, multikey, dump=True, default = ''):
     :return:
     """
     try:
-        keys=multikey.split('.',1)
+        #keys=multikey.split('.',1)
+        keys = tokenize_with_escape(multikey,escape ='\\',separator='.',n=1)
 
         if isinstance(data, Mapping) and keys[0] != '':
             try:
@@ -225,7 +404,15 @@ def getDictValue(data, multikey, dump=True, default = ''):
                     listkey = keys[1] if len(keys) > 1 else ''
                     value=[]
                     for elem in data:
-                        value.append(getDictValue(data[elem],listkey,dump, default))
+                        item = getDictValue(data[elem],listkey,dump, default)
+                        if isinstance(item,list):
+                            value.extend(item)
+                        else:
+                            value.append(item)
+
+                elif keys[0] == '**':
+                    listkey = keys[1] if len(keys) > 1 else ''
+                    value = findDictValues(data, listkey, dump, default)
                 else:
                     value = default
 
@@ -235,14 +422,25 @@ def getDictValue(data, multikey, dump=True, default = ''):
                 if len(keys) > 1:
                     value = getDictValue(value,keys[1],dump, default)
             except:
-                if keys[0] == '*':
+                if keys[0] == '**':
                     listkey = keys[1] if len(keys) > 1 else ''
-                else:
-                    listkey = keys[0]
+                    value = findDictValues(data, listkey, dump, default)
 
-                value=[]
-                for elem in data:
-                    value.append(getDictValue(elem, listkey, dump, default))
+                else:
+                    if keys[0] == '*':
+                        listkey = keys[1] if len(keys) > 1 else ''
+                    else:
+                        listkey = keys[0]
+
+                    value=[]
+                    for elem in data:
+                        item = getDictValue(elem, listkey, dump, default)
+                        if isinstance(item, list):
+                            value.extend(item)
+                        else:
+                            value.append(item)
+
+
         elif keys[0] == '':
             value = data
         else:
@@ -417,7 +615,7 @@ def elementToJson(element, context=True):
 
 
 
-def extractLinks(data,baseurl):
+def extractLinks(data,baseurl,parseurl=True):
     links = []
     soup = lxml.html.fromstring(data)
 
@@ -429,16 +627,62 @@ def extractLinks(data,baseurl):
         link = elementToJson(part, True)
         if link.get('@href',None) is not None:
             link['url'] = urllib.parse.urljoin(baseurl, link.get('@href',None))
+            if parseurl:
+                parts = extractURLparts(link['url'],usecache=True)
+                link.update(parts)
         links.append(link)
 
     return links, base
 
+urlcache = {}
+def extractURLparts(url_absolut,prefix="url_",usecache=False):
+    cachekey = prefix + url_absolut
+    if not usecache or (not cachekey in urlcache):
+        item = {}
+        # Domain etc. aus der absoluten URL rausziehen und im dict speichern
+        try:
+            parsed_uri = urllib.parse.urlparse(url_absolut)
+
+            item[prefix + 'domain'] = parsed_uri.netloc
+            item[prefix + 'scheme'] = parsed_uri.scheme
+            item[prefix + 'path'] = parsed_uri.path
+            item[prefix + 'params'] = parsed_uri.params
+            item[prefix + 'query'] = parsed_uri.query
+            item[prefix + 'fragment'] = parsed_uri.fragment
+        except:
+            pass
+
+        # Parse domain
+        try:
+            domainparts = tldextract.extract(item[prefix + 'domain'])
+            item[prefix + 'domain_subdomain'] = domainparts.subdomain
+            item[prefix + 'domain_domain'] = domainparts.domain
+            item[prefix + 'domain_suffix'] = domainparts.suffix
+
+        except:
+            pass
+
+        # Normalize domain
+        try:
+            domainnormalized = re.sub("^www\.", "", parsed_uri.netloc).lower()
+            domainnormalized = re.sub(":[0-9]+$", "", domainnormalized)
+            item[prefix + 'domain_normalized'] = domainnormalized
+        except Exception as e:
+            pass
+
+        urlcache[cachekey] = item
+
+    return urlcache[cachekey]
+
 def extractHtml(html, selector, type='css', dump=False):
     items = []
 
-    if html != '':
+    if html.strip() != '':
         try:
-            soup = lxml.html.fromstring(html.encode('utf-8'))
+            try:
+                soup = lxml.html.fromstring(html)
+            except ValueError:
+                soup = lxml.html.fromstring(html.encode('utf-8'))
 
             if type == 'css':
                 for item in soup.cssselect(selector):
@@ -459,11 +703,11 @@ def extractHtml(html, selector, type='css', dump=False):
 
 def xmlToJson(data):
     bf = BadgerFish(dict_type=OrderedDict)
-    xml = lxml.html.fromstring(data)
+    xml = lxml.html.fromstring(data.encode('utf-8'))
     data = bf.data(xml)
     return data
 
-
+#' Create a new filename from an URL
 def makefilename(url = None, foldername=None, filename=None, fileext=None, appendtime=False):  # Create file name
     url_filename, url_fileext = os.path.splitext(os.path.basename(url))
     if fileext is None:
@@ -471,7 +715,7 @@ def makefilename(url = None, foldername=None, filename=None, fileext=None, appen
     if filename is None:
         filename = url_filename
 
-    filename = re.sub(r'[^a-zA-Z0-9_.-]+', '', filename)
+    filename = re.sub(r'[^a-zA-Z0-9_.-]+', '_', filename.strip())
     fileext = re.sub(r'[^a-zA-Z0-9_.-]+', '', fileext)
 
     filetime = time.strftime("%Y-%m-%d-%H-%M-%S")
@@ -547,6 +791,15 @@ def wraptip(value):
         pass
     return value
 
+def dictToTuples(value):
+    tuples = []
+    for n, v in value.items():
+        if isinstance(v, list):
+            tuples.extend([(n, s) for s in v])
+        else:
+            tuples.append((n, v))
+    return tuples
+
 def formatdict(data):
     def getdictvalues(data, parentkeys = []):
         out = []
@@ -563,22 +816,39 @@ def formatdict(data):
     return "\n".join(getdictvalues(data))
 
 
-def tokenize_with_escape(a, escape='\\', separator='|'):
+
+def tokenize_with_escape(a, escape='\\', separator='|', n = None):
     '''
         Tokenize a string with escape characters
+        @n number of token to consume or None for all tokens
     '''
     result = []
     token = ''
     state = 0
-    for c in a:
-        if state == 0:
-            if c == escape:
+    for i, c in enumerate(a):
+        # Rest of string
+        if state == 2:
+            token += c
+
+        # Next character (state 0: not in escape sequence)
+        elif state == 0:
+            # Swith to escape sequence state
+            if (c == escape) and (i < len(a)-1) and (a[i+1] == separator):
                 state = 1
+
+            # Or tokenize
             elif c == separator:
                 result.append(token)
+                if (n is not None) and (len(result) == n):
+                    state = 2
+
                 token = ''
+
+            # Or add to token
             else:
                 token += c
+
+        # Escaped character
         elif state == 1:
             token += c
             state = 0

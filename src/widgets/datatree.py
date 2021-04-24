@@ -6,8 +6,11 @@ from collections import defaultdict
 
 class DataTree(QTreeView):
 
-    nodeSelected = Signal(list)
+    nodeSelected = Signal(QModelIndex)
     logmessage = Signal(str)
+    showprogress = Signal(int)
+    stepprogress = Signal()
+    hideprogress = Signal()
 
     def __init__(self, parent=None):
         super(DataTree, self).__init__(parent)
@@ -21,18 +24,21 @@ class DataTree(QTreeView):
     def loadData(self, database):
         self.treemodel = TreeModel(database)
         self.treemodel.logmessage.connect(self.logmessage)
+        self.treemodel.showprogress.connect(self.showprogress.emit)
+        self.treemodel.hideprogress.connect(self.hideprogress.emit)
+        self.treemodel.stepprogress.connect(self.stepprogress.emit)
         self.setModel(self.treemodel)
 
     @Slot()
     def currentChanged(self, current, previous):
         super(DataTree, self).currentChanged(current, previous)
-        self.nodeSelected.emit(current) #,self.selectionModel().selectedRows()
+        self.nodeSelected.emit(current)
 
     @Slot()
     def selectionChanged(self, selected, deselected):
         super(DataTree, self).selectionChanged(selected, deselected)
         current = self.currentIndex()
-        self.nodeSelected.emit(current)  # ,self.selectionModel().selectedRows()
+        self.nodeSelected.emit(current)
 
     def selectedCount(self):
         indexes = self.selectionModel().selectedRows()
@@ -43,6 +49,7 @@ class DataTree(QTreeView):
         
         model = self.model()
         parent = QModelIndex()
+        model.fetchMore(parent)
         row = model.rowCount(parent)-1
          
         index = model.index(row, 0, parent)
@@ -201,42 +208,23 @@ class TreeItem(object):
             return self.data['level']
 
     def row(self):
-        if self.parentItem is not None:
-            return self.parentItem.childItems.index(self)
+        return self._row
+        # if self.parentItem is not None:
+        #     return self.parentItem.childItems.index(self)
 
         return None
 
 
-    def appendNodes(self, data, options, headers=None, delaycommit=False):
+    def appendNodes(self, data, options, delaycommit=False):
         """Append nodes after fetching data
         """
         dbnode = Node.query.get(self.id)
         if not dbnode:
             return False
 
-        #filter response
-        if options['nodedata'] is None:
-            subkey = 0
-            nodes = data
-            offcut = None
-        elif hasDictValue(data,options['nodedata'], piped=True):
-            subkey = options['nodedata'].split('|').pop(0).rsplit('.', 1)[0]
-            name, nodes = extractValue(data, options['nodedata'], False)
-            offcut = filterDictValue(data, options['nodedata'], False, piped=True)
-        else:
-            subkey = options['nodedata'].split('|').pop(0).rsplit('.', 1)[0]
-            nodes = []
-            offcut = data
-
-        if not (type(nodes) is list):
-            nodes = [nodes]
-            fieldsuffix = ''
-        else:
-            fieldsuffix = '.*'
-
         newnodes = []
 
-        def appendNode(objecttype, objectid, response, fieldsuffix = ''):
+        def appendNode(objecttype, objectid, response, extractedkey=''):
             new = Node(str(objectid), dbnode.id)
             new.objecttype = objecttype
             new.response = response
@@ -247,20 +235,17 @@ class TreeItem(object):
             new.querytype = options.get('querytype', '')
 
             queryparams = {key : options.get(key,'') for key in  ['nodedata','basepath','resource']}
-            queryparams['nodedata'] = queryparams['nodedata'] + fieldsuffix if queryparams['nodedata'] is not None else queryparams['nodedata']
+            queryparams['nodedata'] = extractedkey
             new.queryparams = queryparams
 
             newnodes.append(new)
 
-
         #empty records
-        if len(nodes) == 0:
-            appendNode('empty', dbnode.objectid, {})
+        if data['empty'] is not None:
+            appendNode('empty', dbnode.objectid, data['empty'])
 
         #extracted nodes
-        for n in nodes:
-            n = n if isinstance(n, Mapping) else {subkey: n}
-
+        for k, n in data['nodes']:
             # Extract Object ID or use parent id if no key present
             o = options.get('objectid')
             if o is not None:
@@ -268,16 +253,16 @@ class TreeItem(object):
             if o is None:
                 o = dbnode.objectid
 
-            appendNode('data', o, n, fieldsuffix)
+            objecttype = options.get('objecttype', 'data')
+            appendNode(objecttype, o, n, k)
 
-        #Offcut
-        if offcut is not None:
-            appendNode('offcut', dbnode.objectid, offcut)
+        #offcut
+        if data['offcut'] is not None:
+            appendNode('offcut', dbnode.objectid, data['offcut'])
 
-        #Headers
-        if options.get('saveheaders',False) and headers is not None:
-            appendNode('headers',dbnode.objectid,headers)
-
+        #headers
+        if data['headers'] is not None:
+            appendNode('headers', dbnode.objectid, data['headers'])
 
         self.model.database.session.add_all(newnodes)
         self._childcountall += len(newnodes)
@@ -288,6 +273,7 @@ class TreeItem(object):
         self.model.commitNewNodes(delaycommit)
         # self.model.database.session.commit()
         # self.model.layoutChanged.emit()
+        return (len(data['nodes']))
 
     def hasValues(self,filter = {}):
         if self.data is None:
@@ -301,46 +287,35 @@ class TreeItem(object):
         return True
 
     def unpackList(self, key_nodes, key_objectid, delaycommit=False):
-        dbnode = Node.query.get(self.id)
+        options={
+            'nodedata':key_nodes,
+            'objectid':key_objectid,
+            'offcut': False,
+            'empty': True,
+            'objecttype': 'unpacked',
+            'querystatus': self.data.get("querystatus", ""),
+            'querytime': self.data.get("querytime", ""),
+            'querytype': self.data.get('querytype', '')
+            #'queryparams' : self.data.get('queryparams',{})
+        }
 
-        # extract nodes
-        name, nodes = extractValue(dbnode.response, key_nodes, dump=False)
-        if not (type(nodes) is list):
-            nodes = [nodes]
+        data = sliceData(self.data.get("response", {}), None, options)
+        self.appendNodes(data, options, delaycommit=delaycommit)
 
-        # add nodes
-        #subkey = key_nodes.split("|").pop(0).rsplit('.', 1)[0]
-        subkey_name, subkey_key, subkey_pipeline = parseKey(key_nodes)
-        subkey = subkey_name if subkey_name is not None else subkey_key.rsplit('.', 1)[0]
-        newnodes = []
-        for n in nodes:
-            objectid = extractValue(n, key_objectid)[1]
-            response = n if isinstance(n, Mapping) else {subkey : n}
+    def copyNode(self, delaycommit=False):
+        objectid = self.data.get("objectid")
+        self.model.addSeedNodes([objectid],delaycommit=delaycommit)
 
-            new = Node(objectid, dbnode.id)
-            new.objecttype = 'unpacked'
-            new.response = response
-            new.level = dbnode.level + 1
-            new.querystatus = dbnode.querystatus
-            new.querytime = dbnode.querytime
-            new.querytype = dbnode.querytype
-            new.queryparams = dbnode.queryparams
-            newnodes.append(new)
-
-
-        self.model.database.session.add_all(newnodes)
-        self._childcountall += len(newnodes)
-        dbnode.childcount += len(newnodes)
-
-        self.model.newnodes += len(newnodes)
-        self.model.nodecounter += len(newnodes)
-        self.model.commitNewNodes(delaycommit)
 
     def __repr__(self):
         return self.id
 
 class TreeModel(QAbstractItemModel):
     logmessage = Signal(str)
+    showprogress = Signal(int)
+    hideprogress = Signal()
+    stepprogress = Signal()
+
 
     def __init__(self, database, parent=None):
         super(TreeModel, self).__init__(parent)
@@ -370,7 +345,9 @@ class TreeModel(QAbstractItemModel):
         self.layoutChanged.emit()
 
     def deleteNode(self, index, delaycommit=False):
-        if (not self.database.connected) or (not index.isValid()) or (index.column() != 0):
+        if (not self.database.connected) or\
+                (not index.isValid()) or\
+                (index.column() != 0):
             return False
 
         self.beginRemoveRows(index.parent(), index.row(), index.row())
@@ -382,7 +359,7 @@ class TreeModel(QAbstractItemModel):
         item.remove(True)
         self.endRemoveRows()
 
-    def addSeedNodes(self, nodesdata, extended=False, progress=None):
+    def addSeedNodes(self, nodesdata, extended=False, progress=None, delaycommit=False):
         """
         Add seed nodes
         """
@@ -398,7 +375,7 @@ class TreeModel(QAbstractItemModel):
                         return False
 
                 if isinstance(nodedata, Mapping):
-                    objectid = list(nodedata.values())[0]
+                    objectid = nodedata.pop(list(nodedata.keys())[0])
                     response = nodedata
 
                 elif extended:
@@ -420,11 +397,14 @@ class TreeModel(QAbstractItemModel):
                 newnodes.append(new)
 
             self.database.session.add_all(newnodes)
-            self.database.session.commit()
             self.rootItem._childcountall += len(newnodes)
             self.rootItem.loaded = False
 
-            self.layoutChanged.emit()
+            self.newnodes += len(newnodes)
+            self.commitNewNodes(delaycommit)
+            #self.database.session.commit()
+            #self.layoutChanged.emit()
+
         except Exception as e:
             self.logmessage.emit(str(e))
 
@@ -440,7 +420,7 @@ class TreeModel(QAbstractItemModel):
         return parentNode.childCount()
 
     def columnCount(self, parent):
-        return 5 + len(self.customcolumns)
+        return 6 + len(self.customcolumns)
 
     def data(self, index, role):
         if not index.isValid():
@@ -449,18 +429,26 @@ class TreeModel(QAbstractItemModel):
         item = index.internalPointer()
 
         if (role == Qt.DisplayRole) or (role == Qt.ToolTipRole):
+            custom_len = len(self.customcolumns)
+            default_len = 6
+
+            # Default columns
             if index.column() == 0:
                 value = item.data.get('objectid','')
             elif index.column() == 1:
                 value = item.data.get('objecttype','')
             elif index.column() == 2:
-                value = item.data.get('querystatus','')
+                value = getDictValue(item.data.get('queryparams',''), 'nodedata')
             elif index.column() == 3:
-                value = item.data.get('querytime','')
+                value = item.data.get('querystatus','')
             elif index.column() == 4:
+                value = item.data.get('querytime','')
+            elif index.column() == 5:
                 value = item.data.get('querytype','')
+
+            # Custom columns
             else:
-                key = self.customcolumns[index.column() - 5]
+                key = self.customcolumns[index.column() - default_len]
                 value = extractValue(item.data.get('response',''), key)[1]
 
             if role == Qt.ToolTipRole:
@@ -472,14 +460,19 @@ class TreeModel(QAbstractItemModel):
         if not self.hasIndex(row, column, parent):
             return QModelIndex()
 
-        parentNode = self.getItemFromIndex(parent)
-        childItem = parentNode.child(row)
+        if not parent.isValid():
+            return self.createIndex(row, column, self.rootItem.childItems[row])
+
+        parentNode = parent.internalPointer()
+        childItem = parentNode.childItems[row]
 
         return self.createIndex(row, column, childItem)
 
     def parent(self, index):
-        node = index.internalPointer()
+        if not index.isValid():
+            return QModelIndex()
 
+        node = index.internalPointer()
         parentNode = node.parent()
 
         if parentNode == self.rootItem:
@@ -498,13 +491,14 @@ class TreeModel(QAbstractItemModel):
 
     def headerData(self, section, orientation, role):
         if role == Qt.DisplayRole:
-            captions = ['Object ID', 'Object Type', 'Query Status', 'Query Time', 'Query Type'] + extractNames(self.customcolumns)
+            captions = ['Object ID','Object Type', 'Object Key', 'Query Status', 'Query Time', 'Query Type']
+            captions += extractNames(self.customcolumns)
             return captions[section] if section < len(captions) else ""
 
         return None
 
     def getRowHeader(self):
-        row = ["id", "parent_id", "level", "object_id", "object_type", "query_status", "query_time", "query_type"]
+        row = ["id", "parent_id", "level", "object_id", "object_type", "object_key", "query_status", "query_time", "query_type"]
         columns = extractNames(self.customcolumns)
         for key in columns:
             row.append(key)
@@ -517,6 +511,7 @@ class TreeModel(QAbstractItemModel):
                node.data['level'],
                node.data['objectid'],
                node.data['objecttype'],
+               getDictValue(node.data['queryparams'],'nodedata'),
                node.data['querystatus'],
                node.data['querytime'],
                node.data['querytype']
@@ -588,18 +583,27 @@ class TreeModel(QAbstractItemModel):
             return False
 
         parentItem = self.getItemFromIndex(parent)
-        lastRow = parentItem.childCount()
+        if parentItem == self.rootItem:
+            self.showprogress.emit(len(records))
+        try:
+            lastRow = parentItem.childCount()
 
-        self.beginInsertRows(parent, lastRow, lastRow + len(records) - 1)
+            self.beginInsertRows(parent, lastRow, lastRow + len(records) - 1)
 
-        for record in records:
-            itemdata = self.getItemDataFromRecord(record)
-            new = TreeItem(self, parentItem, record.id, itemdata)
-            new._childcountall = record.childcount
-            new._childcountallloaded = True
+            for record in records:
+                itemdata = self.getItemDataFromRecord(record)
+                new = TreeItem(self, parentItem, record.id, itemdata)
+                new._childcountall = record.childcount
+                new._childcountallloaded = True
 
-        self.endInsertRows()
-        parentItem.loaded = parentItem.childCountAll() == parentItem.childCount()
+                if parentItem == self.rootItem:
+                    self.stepprogress.emit()
+
+            self.endInsertRows()
+            parentItem.loaded = parentItem.childCountAll() <= parentItem.childCount()
+        finally:
+            if parentItem == self.rootItem:
+                self.hideprogress.emit()
 
     def getLastChildData(self, index, filter=None):
         self.fetchMore(index)
@@ -691,15 +695,20 @@ class TreeModel(QAbstractItemModel):
         if not index.isValid():
             return False
 
-        # Find last offcut or data node
         treeitem = index.internalPointer()
-        if options.get('resume', False):
-            filter = {'querystatus': "fetched (200)", 'objecttype': ["data", "offcut"]}
-            treeitem.offcut = self.getLastChildData(index, filter)
+
+        # Check if empty
+        if options.get('emptyonly', False):
+            return treeitem.childCountAll() == 0
+
+        # Find last offcut or data node
+        elif options.get('resume', False):
+            filter = {'querystatus': "fetched (200)", 'objecttype': ["data", "offcut", "empty"]}
+            treeitem.lastdata = self.getLastChildData(index, filter)
 
             # Dont't fetch if already finished (=has offcut without next cursor)
-            if (treeitem.offcut is not None):
-                response = getDictValueOrNone(treeitem.offcut, 'response', dump=False)
+            if (treeitem.lastdata is not None):
+                response = getDictValueOrNone(treeitem.lastdata, 'response', dump=False)
                 cursor = getDictValueOrNone(response, options.get('key_paging'))
                 stopvalue = not extractValue(response, options.get('paging_stop'), dump=False, default=True)[1]
 
@@ -707,7 +716,7 @@ class TreeModel(QAbstractItemModel):
                 if (cursor is None) or stopvalue:
                     return False
         else:
-            treeitem.offcut = None
+            treeitem.lastdata = None
 
         return True
 

@@ -2,7 +2,7 @@ from PySide2.QtCore import *
 from PySide2.QtGui import *
 from PySide2.QtWidgets import QFileDialog, QCheckBox, QComboBox, QLabel, QHBoxLayout
 import csv
-from progressbar import ProgressBar
+from widgets.progressbar import ProgressBar
 from database import *
 
 class ExportFileDialog(QFileDialog):
@@ -55,6 +55,18 @@ class ExportFileDialog(QFileDialog):
         layout.addWidget(QLabel('Export mode'),row+2,0)
         layout.addWidget(self.optionAll,row+2,1,1,2)
         self.setLayout(layout)
+
+        dbfilename = self.mainWindow.database.filename
+        #self.setDirectory(os.path.dirname(dbfilename))
+        filename, ext = os.path.splitext(dbfilename)
+        self.selectFile(filename+'.csv')
+
+        # if not os.path.exists(dbfilename):
+        #     dbfilename = self.mainWindow.settings.value("lastpath", os.path.expanduser("~"))
+        # if not os.path.exists(dbfilename):
+        #     dbfilename = os.path.expanduser("~")
+
+
 
         if self.exec_():
             try:
@@ -139,7 +151,7 @@ class ExportFileDialog(QFileDialog):
                                 lineterminator='\r\n')
 
             # Headers
-            row = ["level", "id", "parent_id", "object_id", "object_type",
+            row = ["level", "id", "parent_id", "object_id", "object_type","object_key",
                    "query_status", "query_time", "query_type"]
             for key in extractNames(self.mainWindow.tree.treemodel.customcolumns):
                 row.append(key)
@@ -159,7 +171,8 @@ class ExportFileDialog(QFileDialog):
                         break
 
                     row = [node.level, node.id, node.parent_id, node.objectid,
-                           node.objecttype, node.querystatus, node.querytime, node.querytype]
+                           node.objecttype,getDictValue(node.queryparams,'nodedata'),
+                           node.querystatus, node.querytime, node.querytype]
                     for key in self.mainWindow.tree.treemodel.customcolumns:
                         row.append(node.getResponseValue(key)[1])
 

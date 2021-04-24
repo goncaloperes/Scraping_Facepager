@@ -1,5 +1,4 @@
 ﻿#!/usr/bin/env python
-#!/usr/bin/env python
 """Facepager was made for fetching public available data from Facebook, Twitter and other JSON-based API. All data is stored in a SQLite database and may be exported to csv. """
 
 # MIT License
@@ -25,50 +24,61 @@
 # SOFTWARE.
 
 import sys
-import html
+import argparse
+from datetime import datetime
 
+import html
 
 from PySide2.QtCore import *
 from PySide2.QtGui import *
-from PySide2.QtWidgets import QWidget
+from PySide2.QtWidgets import QWidget, QStyleFactory
+
 
 from icons import *
-from datatree import *
-from dictionarytree import *
-from database import *
+from widgets.datatree import DataTree
+from widgets.dictionarytree import DictionaryTree
 from actions import *
 from apimodules import *
-from help import *
-from presets import *
-from timer import *
-from apiviewer import *
-from dataviewer import *
-from selectnodes import *
+from dialogs.help import *
+from widgets.progressbar import ProgressBar
+from dialogs.presets import *
+from dialogs.timer import *
+from dialogs.apiviewer import *
+from dialogs.dataviewer import *
+from dialogs.selectnodes import *
+from dialogs.transfernodes import *
+
 import logging
 import threading
+from server import Server, RequestHandler
 
 # Some hackery required for pyInstaller
 # See https://justcode.nimbco.com/PyInstaller-with-Qt5-WebEngineView-using-PySide2/#could-not-find-qtwebengineprocessexe-on-windows
-if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
-    os.environ['QTWEBENGINEPROCESS_PATH'] = os.path.normpath(os.path.join(
-        sys._MEIPASS, 'PySide2', 'Qt', 'lib',
-        'QtWebEngineCore.framework', 'Helpers', 'QtWebEngineProcess.app',
-        'Contents', 'MacOS', 'QtWebEngineProcess'
-    ))
+# if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
+#     os.environ['QTWEBENGINEPROCESS_PATH'] = os.path.normpath(os.path.join(
+#         sys._MEIPASS, 'PySide2', 'Qt', 'lib',
+#         'QtWebEngineCore.framework', 'Helpers', 'QtWebEngineProcess.app',
+#         'Contents', 'MacOS', 'QtWebEngineProcess'
+#     ))
+
+# Fix BigSur not showing windows
+if getattr(sys,'frozen', False) and sys.platform == 'darwin':
+    os.environ['QT_MAC_WANTS_LAYER']='1'
 
 class MainWindow(QMainWindow):
 
     def __init__(self,central=None):
         super(MainWindow,self).__init__()
 
-        self.setWindowTitle("Facepager 4.2")
+        self.setWindowTitle("Facepager 4.3")
         self.setWindowIcon(QIcon(":/icons/icon_facepager.png"))
         QApplication.setAttribute(Qt.AA_DisableWindowContextHelpButton)
+
 
         # This is needed to display the app icon on the taskbar on Windows 7
         if os.name == 'nt':
             import ctypes
-            myappid = 'Facepager.4.2' # arbitrary string
+            myappid = 'Facepager.4.3' # arbitrary string
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
         self.setMinimumSize(1100,680)
@@ -84,11 +94,12 @@ class MainWindow(QMainWindow):
         self.createDB()
         self.updateUI()
         self.updateResources()
+        self.startServer()
 
     def createDB(self):
         self.database = Database(self)
 
-        dbname= sys.argv[1] if len(sys.argv) > 1 else None
+        dbname= cmd_args.database #sys.argv[1] if len(sys.argv) > 1 else None
         lastpath = self.settings.value("lastpath")
 
         if dbname and os.path.isfile(dbname):
@@ -97,30 +108,33 @@ class MainWindow(QMainWindow):
             self.database.connect(self.settings.value("lastpath"))
 
         self.tree.loadData(self.database)
-        self.actions.actionShowColumns.trigger()
+        self.guiActions.actionShowColumns.trigger()
 
     def createActions(self):
-        self.actions=Actions(self)
-
+        self.apiActions = ApiActions(self)
+        self.guiActions = GuiActions(self, self.apiActions)
+        self.serverActions = ServerActions(self, self.apiActions)
 
     def createUI(self):
         #
         #  Windows
         #
 
+        self.progressWindow = None
         self.helpwindow=HelpWindow(self)
         self.presetWindow=PresetWindow(self)
         self.presetWindow.logmessage.connect(self.logmessage)
         self.apiWindow = ApiViewer(self)
         self.apiWindow.logmessage.connect(self.logmessage)
         self.dataWindow = DataViewer(self)
+        self.transferWindow = TransferNodes(self)
         self.timerWindow=TimerWindow(self)
         self.selectNodesWindow=SelectNodesWindow(self)
 
-        self.timerWindow.timerstarted.connect(self.actions.timerStarted)
-        self.timerWindow.timerstopped.connect(self.actions.timerStopped)
-        self.timerWindow.timercountdown.connect(self.actions.timerCountdown)
-        self.timerWindow.timerfired.connect(self.actions.timerFired)
+        self.timerWindow.timerstarted.connect(self.guiActions.timerStarted)
+        self.timerWindow.timerstopped.connect(self.guiActions.timerStopped)
+        self.timerWindow.timercountdown.connect(self.guiActions.timerCountdown)
+        self.timerWindow.timerfired.connect(self.guiActions.timerFired)
 
         #
         #  Statusbar and toolbar
@@ -226,6 +240,84 @@ class MainWindow(QMainWindow):
         bottomSplitter.addWidget(statusWidget)
 
         #
+        # Settings widget
+        #s
+
+        self.settingsWidget = QWidget()
+        self.settingsLayout = QFormLayout()
+        self.settingsLayout.setContentsMargins(0, 0, 0, 0)
+        self.settingsWidget.setLayout(self.settingsLayout)
+
+        # Add headers
+        self.headersCheckbox = QCheckBox("Create header nodes",self)
+        self.headersCheckbox.setChecked(str(self.settings.value('saveheaders', 'false')) == 'true')
+        self.headersCheckbox.setToolTip(
+            wraptip("Check if you want to create nodes containing headers of the response."))
+        self.settingsLayout.addRow(self.headersCheckbox)
+
+        # Full offcut
+        self.offcutCheckbox = QCheckBox("Keep all data in offcut",self)
+        self.offcutCheckbox.setChecked(str(self.settings.value('fulloffcut', 'false')) == 'true')
+        self.offcutCheckbox.setToolTip(
+            wraptip("Check if you don't want to filter out data from the offcut node. Useful for webscraping, keeps the full HTML content"))
+        self.settingsLayout.addRow(self.offcutCheckbox)
+
+
+        # Timeout
+        self.timeoutEdit = QSpinBox(self)
+        self.timeoutEdit.setMinimum(1)
+        self.timeoutEdit.setMaximum(300)
+        self.timeoutEdit.setToolTip(
+            wraptip("How many seconds will you wait for a response?"))
+        self.timeoutEdit.setValue(self.settings.value('timeout',15))
+        self.settingsLayout.addRow('Request timeout',self.timeoutEdit)
+
+        # Max data size
+        self.maxsizeEdit = QSpinBox(self)
+        self.maxsizeEdit.setMinimum(1)
+        self.maxsizeEdit.setMaximum(300000)
+        self.maxsizeEdit.setToolTip(wraptip("How many megabytes will you download at maximum?"))
+        self.maxsizeEdit.setValue(self.settings.value('maxsize',5))
+        self.settingsLayout.addRow('Maximum size',self.maxsizeEdit)
+
+        # Expand Box
+        self.autoexpandCheckbox = QCheckBox("Expand new nodes",self)
+        self.autoexpandCheckbox.setToolTip(wraptip(
+            "Check to automatically expand new nodes when fetching data. Disable for big queries to speed up the process."))
+        self.settingsLayout.addRow(self.autoexpandCheckbox)
+        self.autoexpandCheckbox.setChecked(str(self.settings.value('expand', 'true')) == 'true')
+
+        # Log Settings
+        self.logCheckbox = QCheckBox("Log all requests",self)
+        self.logCheckbox.setToolTip(
+            wraptip("Check to see every request in the status log; uncheck to hide request messages."))
+        self.settingsLayout.addRow( self.logCheckbox)
+        self.logCheckbox.setChecked(str(self.settings.value('logrequests', 'true')) == 'true')
+
+        # Clear setttings
+        self.clearCheckbox = QCheckBox("Clear settings when closing.",self)
+        self.settings.beginGroup("GlobalSettings")
+        self.clearCheckbox.setChecked(str(self.settings.value('clearsettings', 'false')) == 'true')
+        self.settings.endGroup()
+
+        self.clearCheckbox.setToolTip(wraptip(
+            "Check to clear all settings and access tokens when closing Facepager. You should check this on public machines to clear credentials."))
+        self.settingsLayout.addRow(self.clearCheckbox)
+
+        # Style
+        self.styleEdit = QComboBox(self)
+        self.styleEdit.setToolTip(wraptip("Choose the styling of Facepager."))
+
+        styles = [x for x in QStyleFactory.keys() if x != "Windows"]
+        styles = ['<default>'] + styles
+
+        self.styleEdit.insertItems(0, styles)
+        self.styleEdit.setCurrentText(self.settings.value('style', '<default>'))
+
+        self.styleEdit.currentIndexChanged.connect(self.setStyle)
+        self.settingsLayout.addRow('Style', self.styleEdit)
+
+        #
         #  Components
         #
 
@@ -234,31 +326,41 @@ class MainWindow(QMainWindow):
         treetoolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);
         treetoolbar.setIconSize(QSize(16,16))
 
-        treetoolbar.addActions(self.actions.treeActions.actions())
+        treetoolbar.addActions(self.guiActions.treeActions.actions())
         dataLayout.addWidget (treetoolbar)
 
         self.tree=DataTree(self.mainWidget)
-        self.tree.nodeSelected.connect(self.actions.treeNodeSelected)
+        self.tree.nodeSelected.connect(self.guiActions.treeNodeSelected)
         self.tree.logmessage.connect(self.logmessage)
+        self.tree.showprogress.connect(self.showprogress)
+        self.tree.hideprogress.connect(self.hideprogress)
+        self.tree.stepprogress.connect(self.stepprogress)
         dataLayout.addWidget(self.tree)
 
 
-        #right sidebar - toolbar
-        detailtoolbar = QToolBar(self)
-        detailtoolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);
-        detailtoolbar.setIconSize(QSize(16,16))
-        detailtoolbar.addActions(self.actions.detailActions.actions())
-        detailLayout.addWidget (detailtoolbar)
+        #right sidebar - json toolbar
+        jsontoolbar = QToolBar(self)
+        jsontoolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);
+        jsontoolbar.setIconSize(QSize(16,16))
+        jsontoolbar.addActions(self.guiActions.detailActions.actions())
+        detailLayout.addWidget(jsontoolbar)
 
         #right sidebar - json viewer
         self.detailTree=DictionaryTree(self.mainWidget,self.apiWindow)
         detailLayout.addWidget(self.detailTree)
 
-        #right sidebar - column setup
-        detailGroup=QGroupBox("Custom Table Columns (one key per line)")
+        # right sidebar - column setup
+        detailGroup = QWidget()
         detailSplitter.addWidget(detailGroup)
-        groupLayout=QVBoxLayout()
+        groupLayout = QVBoxLayout()
         detailGroup.setLayout(groupLayout)
+
+        #column setup toolbar
+        columntoolbar = QToolBar(self)
+        columntoolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);
+        columntoolbar.setIconSize(QSize(16,16))
+        columntoolbar.addActions(self.guiActions.columnActions.actions())
+        groupLayout.addWidget(columntoolbar)
 
         self.fieldList=QTextEdit()
         self.fieldList.setLineWrapMode(QTextEdit.NoWrap)
@@ -267,33 +369,12 @@ class MainWindow(QMainWindow):
         self.fieldList.clear()
         self.fieldList.append('name')
         self.fieldList.append('message')
-#         self.fieldList.append('type')
-#         self.fieldList.append('metadata.type')
-#         self.fieldList.append('talking_about_count')
-#         self.fieldList.append('likes')
-#         self.fieldList.append('likes.count')
-#         self.fieldList.append('shares.count')
-#         self.fieldList.append('comments.count')
-#         self.fieldList.append('created_time')
-#         self.fieldList.append('updated_time')
-
         self.fieldList.setPlainText(self.settings.value('columns',self.fieldList.toPlainText()))
 
         groupLayout.addWidget(self.fieldList)
 
-        columnlayout=QHBoxLayout()
-        groupLayout.addLayout(columnlayout)
-
-        button=QPushButton("Apply Column Setup")
-        button.setToolTip(wraptip("Apply the columns to the central data view. New columns may be hidden and are appended on the right side"))
-        button.clicked.connect(self.actions.actionShowColumns.trigger)
-        columnlayout.addWidget(button)
-
-        button=QPushButton("Clear Column Setup")
-        button.setToolTip(wraptip("Remove all columns to get space for a new setup."))
-        button.clicked.connect(self.actions.actionClearColumns.trigger)
-        columnlayout.addWidget(button)
-
+        #columnhelp = QLabel("Custom table columns: one key per line")
+        #groupLayout.addWidget(columnhelp)
 
         #Requests/Apimodules
         self.RequestTabs=QTabWidget()
@@ -323,16 +404,16 @@ class MainWindow(QMainWindow):
         self.allnodesCheckbox.setToolTip(wraptip("Check if you want to fetch data for all nodes. This helps with large datasets because manually selecting all nodes slows down Facepager."))
         fetchsettings.addRow("Select all nodes", self.allnodesCheckbox)
 
+        #-Empty nodes
+        self.emptyCheckbox = QCheckBox(self)
+        self.emptyCheckbox.setCheckState(Qt.Unchecked)
+        self.emptyCheckbox.setToolTip(wraptip("Check if you want process only empty nodes."))
+        fetchsettings.addRow("Only empty nodes", self.emptyCheckbox)
+
         #Object types
         self.typesEdit = QLineEdit('offcut')
         self.typesEdit.setToolTip(wraptip("Skip nodes with these object types, comma separated list. Normally this should not be changed."))
         fetchsettings.addRow("Exclude object types",self.typesEdit)
-
-        # #-Empty nodes
-        # self.emptynodesCheckbox = QCheckBox(self)
-        # self.emptynodesCheckbox.setCheckState(Qt.Unchecked)
-        # self.emptynodesCheckbox.setToolTip(wraptip("Check if you want to fetch data only for nodes without children. This can be used to continue cancelled data collection."))
-        # fetchsettings.addRow("Select only empty nodes", self.emptynodesCheckbox)
 
         #-Continue pagination
         self.resumeCheckbox = QCheckBox(self)
@@ -363,36 +444,13 @@ class MainWindow(QMainWindow):
         self.errorEdit.setToolTip(wraptip("Set the number of consecutive errors after which fetching will be cancelled. Please handle with care! Continuing with erroneous requests places stress on the servers."))
         fetchsettings.addRow("Maximum errors", self.errorEdit)
 
-
-        #Add headers
-        self.headersCheckbox = QCheckBox(self)
-        #self.headersCheckbox.setCheckState(Qt.Checked)
-        self.headersCheckbox.setToolTip(wraptip("Check if you want to create nodes containing headers of the response."))
-        fetchsettings.addRow("Header nodes", self.headersCheckbox)
-
-        #Expand Box
-        self.autoexpandCheckbox = QCheckBox(self)
-        self.autoexpandCheckbox.setCheckState(Qt.Unchecked)
-        self.autoexpandCheckbox.setToolTip(wraptip("Check to automatically expand new nodes when fetching data. Disable for big queries to speed up the process."))
-        fetchsettings.addRow("Expand new nodes", self.autoexpandCheckbox)
-
-        #Log Settings
-        self.logCheckbox = QCheckBox(self)
-        self.logCheckbox.setCheckState(Qt.Checked)
-        self.logCheckbox.setToolTip(wraptip("Check to see every request in status window; uncheck to hide request messages."))
-        fetchsettings.addRow("Log all requests", self.logCheckbox)
-
-        #Clear setttings
-        self.clearCheckbox = QCheckBox(self)
-        self.settings.beginGroup("GlobalSettings")
-        clear = self.settings.value('clearsettings',False)
-        self.clearCheckbox.setChecked(str(clear)=="true")
-        self.settings.endGroup()
-
-        self.clearCheckbox.setToolTip(wraptip("Check to clear all settings and access tokens when closing Facepager. You should check this on public machines to clear credentials."))
-        fetchsettings.addRow("Clear settings when closing", self.clearCheckbox)
-
-
+        #More
+        button=QPushButton(QIcon(":/icons/more.png"),"", self.mainWidget)
+        button.setToolTip(wraptip("Can't get enough? Here you will find even more settings!"))
+        # button.setMinimumSize(QSize(120,40))
+        # button.setIconSize(QSize(32,32))
+        button.clicked.connect(self.guiActions.actionSettings.trigger)
+        fetchsettings.addRow("More settings", button)
         
         #Fetch data
 
@@ -400,10 +458,10 @@ class MainWindow(QMainWindow):
         f=QFont()
         f.setPointSize(11)
         button=QPushButton(QIcon(":/icons/fetch.png"),"Fetch Data", self.mainWidget)
-        button.setToolTip(wraptip("Fetch data from the API with the current settings"))
+        button.setToolTip(wraptip("Fetch data from the API with the current settings. If you click the button with the control key pressed, a browser window is opened instead."))
         button.setMinimumSize(QSize(120,40))
         button.setIconSize(QSize(32,32))
-        button.clicked.connect(self.actions.actionQuery.trigger)
+        button.clicked.connect(self.guiActions.actionQuery.trigger)
         button.setFont(f)
         fetchdata.addWidget(button,1)
 
@@ -412,7 +470,7 @@ class MainWindow(QMainWindow):
         button.setIcon(QIcon(":/icons/timer.png"))
         button.setMinimumSize(QSize(40,40))
         button.setIconSize(QSize(25,25))
-        button.clicked.connect(self.actions.actionTimer.trigger)
+        button.clicked.connect(self.guiActions.actionTimer.trigger)
         fetchdata.addWidget(button,1)
 
         #Status
@@ -428,6 +486,15 @@ class MainWindow(QMainWindow):
         self.loglist.acceptRichText=False
         self.loglist.clear()
         groupLayout.addWidget(self.loglist)
+
+    def setStyle(self):
+        style = self.styleEdit.currentText()
+        try:
+            if style == '<default>':
+                style = self.styleEdit.itemText(1)
+            QApplication.setStyle(style)
+        except Exception as e:
+            self.logmessage(e)
 
     def databaseLabelClicked(self):
         if self.database.connected:
@@ -448,8 +515,8 @@ class MainWindow(QMainWindow):
 
     def updateUI(self):
         #disable buttons that do not work without an opened database
-        self.actions.databaseActions.setEnabled(self.database.connected)
-        self.actions.actionQuery.setEnabled(self.tree.selectedCount() > 0)
+        self.guiActions.databaseActions.setEnabled(self.database.connected)
+        self.guiActions.actionQuery.setEnabled(self.tree.selectedCount() > 0)
 
         if self.database.connected:
             #self.statusBar().showMessage(self.database.filename)
@@ -471,6 +538,26 @@ class MainWindow(QMainWindow):
         t = threading.Thread(target=getter)
         t.start()
 
+    def startServer(self):
+        port = cmd_args.port
+        if port is None:
+            self.serverInstance = None
+            self.serverThread = None
+            return False
+
+        self.serverInstance = Server(port, self.serverActions)
+        self.serverThread = threading.Thread(target=self.serverInstance.serve_forever)
+        self.serverThread.start()
+        self.logmessage('Server started on http://localhost:%d.' % port)
+
+    def stopServer(self):
+        if self.serverInstance is not None:
+            self.serverInstance.shutdown()
+            self.logmessage("Server stopped")
+
+    def cleanupModules(self):
+        for i in range(self.RequestTabs.count()):
+            self.RequestTabs.widget(i).cleanup()
 
     def writeSettings(self):
         QCoreApplication.setOrganizationName("Strohne")
@@ -480,13 +567,18 @@ class MainWindow(QMainWindow):
         self.settings.beginGroup("MainWindow")
         self.settings.setValue("size", self.size())
         self.settings.setValue("pos", self.pos())
-        self.settings.setValue("version","4.2")
+        self.settings.setValue("version","4.3")
         self.settings.endGroup()
 
 
         self.settings.setValue('columns',self.fieldList.toPlainText())
         self.settings.setValue('module',self.RequestTabs.currentWidget().name)
         self.settings.setValue("lastpath", self.database.filename)
+
+        self.settings.setValue('saveheaders', self.autoexpandCheckbox.isChecked())
+        self.settings.setValue('expand', self.autoexpandCheckbox.isChecked())
+        self.settings.setValue('logrequests', self.logCheckbox.isChecked())
+        self.settings.setValue('style', self.styleEdit.currentText())
 
         self.settings.beginGroup("GlobalSettings")
         self.settings.setValue("clearsettings", self.clearCheckbox.isChecked())
@@ -521,14 +613,17 @@ class MainWindow(QMainWindow):
                 self.deleteSettings()
             else:
                 self.writeSettings()
+
+            self.stopServer()
+            self.cleanupModules()
             event.accept()
         else:
             event.ignore()
 
     @Slot(str)
-    def logmessage(self,message):
+    def logmessage(self, message):
         with self.lock_logging:
-            if isinstance(message,Exception):
+            if isinstance(message, Exception):
                 self.loglist.append(str(datetime.now())+" Exception: "+str(message))
                 logging.exception(message)
 
@@ -536,9 +631,35 @@ class MainWindow(QMainWindow):
                 self.loglist.append(str(datetime.now())+" "+message)
             time.sleep(0)
 
+    def getlog(self):
+        with self.lock_logging:
+            return self.loglist.toPlainText().splitlines()
+
+    @Slot(str)
+    def showprogress(self, maximum=None):
+        pass
+        # if self.progressWindow is None:
+        #     self.progressWindow = ProgressBar("Loading nodes...",self)
+        #
+        # self.progressWindow.setMaximum(maximum)
+
+
+    @Slot(str)
+    def stepprogress(self):
+        pass
+        # if (self.progressWindow is not None):
+        #     self.progressWindow.step()
+
+    @Slot(str)
+    def hideprogress(self):
+        pass
+        # if self.progressWindow is not None:
+        #     self.progressWindow.close()
+        #     self.progressWindow = None
+
 class Toolbar(QToolBar):
     """
-    Initialize the main toolbar for the facepager - that provides the central interface and functions.
+    Initialize the main toolbar - provides the main actions
     """
     def __init__(self,parent=None,mainWindow=None):
         super(Toolbar,self).__init__(parent)
@@ -546,17 +667,19 @@ class Toolbar(QToolBar):
         self.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);
         self.setIconSize(QSize(24,24))
 
-        self.addActions(self.mainWindow.actions.basicActions.actions())
+        self.addActions(self.mainWindow.guiActions.basicActions.actions())
         self.addSeparator()
-        self.addActions(self.mainWindow.actions.databaseActions.actions())
+
+        self.addAction(self.mainWindow.guiActions.actionAdd)
+        self.addAction(self.mainWindow.guiActions.actionDelete)
 
         self.addSeparator()
-        #self.addAction(self.mainWindow.actions.actionExpandAll)
-        #self.addAction(self.mainWindow.actions.actionCollapseAll)
-        #self.addAction(self.mainWindow.actions.actionSelectNodes)
-        self.addAction(self.mainWindow.actions.actionLoadPreset)
-        self.addAction(self.mainWindow.actions.actionLoadAPIs)
-        self.addAction(self.mainWindow.actions.actionHelp)
+        self.addAction(self.mainWindow.guiActions.actionLoadPreset)
+        self.addAction(self.mainWindow.guiActions.actionLoadAPIs)
+
+        self.addSeparator()
+        self.addAction(self.mainWindow.guiActions.actionExport)
+        self.addAction(self.mainWindow.guiActions.actionHelp)
 
 
 
@@ -633,36 +756,51 @@ class QAwesomeTooltipEventFilter(QObject):
         # Else, defer to the default superclass handling of this event.
         return super().eventFilter(widget, event)
 
+
+
 def startMain():
     app = QApplication(sys.argv)
-
 
     # Word wrap tooltips (does not work yet, chrashes app)
     #tooltipfilter = QAwesomeTooltipEventFilter(app)
     #app.installEventFilter(tooltipfilter)
 
     main=MainWindow()
-    main.show()
 
+    # Change styling
+    if cmd_args.style is not None:
+        QApplication.setStyle(cmd_args.style)
+    #elif sys.platform == 'darwin':
+    #    QApplication.setStyle('Fusion')
+    elif main.settings.value('style', '<default>') != '<default>':
+        QApplication.setStyle(main.settings.value('style'))
+
+    main.show()
     sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
+    # Logging
     try:
         logfolder = os.path.join(os.path.expanduser("~"),'Facepager','Logs')
         if not os.path.isdir(logfolder):
             os.makedirs(logfolder)
         logging.basicConfig(filename=os.path.join(logfolder,'facepager.log'),level=logging.ERROR,format='%(asctime)s %(levelname)s:%(message)s')
+        #logging.basicConfig(filename=os.path.join(logfolder, 'facepager.log'), level=logging.DEBUG,format='%(asctime)s %(levelname)s:%(message)s')
     except Exception as e:
         print("Error intitializing log file: {}".format(e.message))
 
+    # Command line options
+    cmd_args = argparse.ArgumentParser(description='Run Facepager.')
+
+    cmd_args.add_argument('database', help='Database file to open', nargs='?')
+    cmd_args.add_argument('--style', dest='style', default=None, help='Select the PySide style, for example Fusion')
+    cmd_args.add_argument('--server', dest='port', default=None, type=int, help='Start a local server at the given port') #8009
+
+    cmd_args = cmd_args.parse_args()
 
     # Locate the SSL certificate for requests
-    os.environ['REQUESTS_CA_BUNDLE'] = os.path.join(getResourceFolder() , 'ssl', 'cacert.pem')
+    # todo: no longer necessary because requests uses certifi? https://requests.readthedocs.io/en/master/user/advanced/#ca-certificates
+    # os.environ['REQUESTS_CA_BUNDLE'] = os.path.join(getResourceFolder() , 'ssl', 'cacert.pem')
 
-    #cProfile.run('startMain()')
-    #yappi.start()
     startMain()
-    #yappi.print_stats()
-
-
