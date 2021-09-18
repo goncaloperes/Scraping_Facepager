@@ -272,17 +272,11 @@ class ApiTab(QScrollArea):
             payload = BufferReader(payload,callback)
             return payload
 
-    def getFromDoc(self, dockey, defaultkey = None):
-        dockey = dockey.replace("<", "{").replace(">", "}")
-        value = getDictValue(self.apidoc, dockey, dump=False, default=None)
-        if (value is None) and (defaultkey is not None):
-            value = self.defaults.get(defaultkey)
-        return value
-
     # Gets data from input fields or defaults (never gets credentials from default values!)
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+    def getSettings(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
         options = {}
 
+        defaults = self.getDefaultAndDocOptions()
         #options['module'] = self.name
 
         #options for request
@@ -294,7 +288,7 @@ class ApiTab(QScrollArea):
             pass
 
         # Extension (for Twitter, deprecated)
-        options['extension'] = self.defaults.get('extension', '')
+        options['extension'] = defaults.get('extension','')
         if (options['extension'] != '') and options['resource'].endswith(options['extension']):
             options['extension'] = ''
 
@@ -304,14 +298,11 @@ class ApiTab(QScrollArea):
             options['verb'] = self.verbEdit.currentText().strip()            
         except AttributeError:
             pass
-
-        # Get doc key for lookup of data handling keys
-        doc_resource = options.get('resource', '').strip()
-        if doc_resource == '':
-            doc_resource = '0'
-
-        doc_path = 'paths.' + doc_resource + '.get'
-        doc_response = doc_path +'.responses.200.content.application/json.schema.'
+        #
+        # # Get doc key for lookup of data handling keys
+        # doc_resource = options.get('resource', '').strip()
+        # if doc_resource == '':
+        #     doc_resource = '0'
 
         #format
         try:
@@ -344,17 +335,17 @@ class ApiTab(QScrollArea):
             pass
 
         try:
-            options['paging_type'] = self.pagingTypeEdit.currentText().strip() if self.pagingTypeEdit.currentText() != "" else self.defaults.get('paging_type', '')
-            options['key_paging'] = self.pagingkeyEdit.text() if self.pagingkeyEdit.text() != "" else self.defaults.get('key_paging',None)
-            options['paging_stop'] = self.pagingstopEdit.text() if self.pagingstopEdit.text() != "" else self.defaults.get('paging_stop',None)
-            options['param_paging'] = self.pagingparamEdit.text() if self.pagingparamEdit.text() != "" else self.defaults.get('param_paging',None)
+            options['paging_type'] = self.pagingTypeEdit.currentText().strip() if self.pagingTypeEdit.currentText() != "" else defaults.get('paging_type', '')
+            options['key_paging'] = self.pagingkeyEdit.text() if self.pagingkeyEdit.text() != "" else defaults.get('key_paging',None)
+            options['paging_stop'] = self.pagingstopEdit.text() if self.pagingstopEdit.text() != "" else defaults.get('paging_stop',None)
+            options['param_paging'] = self.pagingparamEdit.text() if self.pagingparamEdit.text() != "" else defaults.get('param_paging',None)
             options['offset_start'] = self.offsetStartEdit.value()
             options['offset_step'] = self.offsetStepEdit.value()
         except AttributeError:
-            options['paging_type'] = self.getFromDoc(doc_path + '.x-facepager-pagination.method', 'paging_type')
-            options['key_paging'] = self.getFromDoc(doc_path + '.x-facepager-pagination.key', 'key_paging')
-            options['paging_stop'] = self.getFromDoc(doc_path+ '.x-facepager-pagination.stop', 'paging_stop')
-            options['param_paging'] = self.getFromDoc(doc_path + '.x-facepager-pagination.param', 'param_paging')
+            options['paging_type'] = defaults.get('paging_type')
+            options['key_paging'] = defaults.get('key_paging')
+            options['paging_stop'] = defaults.get('paging_stop')
+            options['param_paging'] = defaults.get('param_paging')
             options['offset_start'] = 1
             options['offset_step'] = 1
 
@@ -376,11 +367,11 @@ class ApiTab(QScrollArea):
 
         #options for data handling
         try:
-            options['nodedata'] = self.extractEdit.text() if self.extractEdit.text() != "" else None
-            options['objectid'] = self.objectidEdit.text() if self.objectidEdit.text() != "" else None
+            options['nodedata'] = self.extractEdit.text() if self.extractEdit.text() != "" else defaults.get('nodedata')
+            options['objectid'] = self.objectidEdit.text() if self.objectidEdit.text() != "" else defaults.get('objectid')
         except AttributeError:
-            options['nodedata'] = self.getFromDoc(doc_response + 'x-facepager-extract')
-            options['objectid'] = self.getFromDoc(doc_response + 'x-facepager-objectid')
+            options['nodedata'] = defaults.get('nodedata')
+            options['objectid'] = defaults.get('objectid')
 
         # Scopes
         try:
@@ -433,28 +424,99 @@ class ApiTab(QScrollArea):
 
         return options
 
-    # Populates input fields from loaded options, presets and default values 
-    def setOptions(self, options):
-        # URLs
-        try:
-            self.basepathEdit.setEditText(options.get('basepath', self.defaults.get('basepath','')))
-            self.resourceEdit.setEditText(options.get('resource', self.defaults.get('resource','')))
-            self.onChangedRelation()
-            self.paramEdit.setParams(options.get('params',self.defaults.get('params','')))
-        except AttributeError:
-            pass
+    def updateBasePath(self, options=None):
+        if options is None:
+            basepath = self.basepathEdit.currentText().strip()
+            options = {'basepath' : basepath}
+        else:
+            basepath = options.get('basepath', '')
+            self.basepathEdit.setEditText(basepath)
+
+        index = self.basepathEdit.findText(basepath)
+        if index != -1:
+            self.basepathEdit.setCurrentIndex(index)
+
+        # Get general doc
+        apidoc = self.mainWindow.apiWindow.getApiDoc(self.name, basepath)
+
+        # apidoc = self.basepathEdit.itemData(index, Qt.UserRole)
+
+        # Add endpoints in reverse order
+        self.resourceEdit.clear()
+        if apidoc and isinstance(apidoc, dict):
+            endpoints = apidoc.get("paths", {})
+            paths = endpoints.keys()
+            for path in list(paths):
+                operations = endpoints[path]
+                path = path.replace("{", "<").replace("}", ">")
+
+                self.resourceEdit.addItem(path)
+                idx = self.resourceEdit.count() - 1
+                self.resourceEdit.setItemData(idx, wraptip(getDictValue(operations, "get.summary", "")), Qt.ToolTipRole)
+
+                # store params for later use in onChangedResource
+                self.resourceEdit.setItemData(idx, operations, Qt.UserRole)
+
+            self.buttonApiHelp.setVisible(True)
+        else:
+            self.resourceEdit.insertItem(0, "/<Object ID>")
+
+    def updateResource(self, options=None):
+        if options is None:
+            resource = self.resourceEdit.currentText().strip()
+            options = {'resource' : resource}
+        else:
+            resource = options.get('resource', '')
+            self.resourceEdit.setEditText(resource)
+
+        index = self.resourceEdit.findText(resource)
+        if index != -1:
+            self.resourceEdit.setCurrentIndex(index)
+
+
+        operations = self.resourceEdit.itemData(index, Qt.UserRole)
+        params = getDictValue(operations, "get.parameters", False) if operations else []
+
+        # Set param names
+        self.paramEdit.setNameOptionsAll(params)
+
+    # Populates input fields from loaded options and presets
+    # Select boxes are updated by onChangedBasepath and onChangedResource
+    # based on the API docs.
+    # @settings Dict with options
+    def setSettings(self, settings = {}):
+
+        # Base path
+        options = self.getDefaultAndDocOptions(settings)
+        self.updateBasePath(options)
+
+        # Resource
+        options = self.getDefaultAndDocOptions(settings)
+        self.updateResource(options)
+
+        # Params and Options
+        options = self.getDefaultAndDocOptions(settings)
+        self.updateParams(options)
+        self.updateOptions(options)
+
+        return options
+
+    def updateParams(self, options):
+        self.paramEdit.setParams(options.get('params', ''))
+
+    def updateOptions(self, options):
 
         # Header and method
         try:
             self.headerEdit.setParams(options.get('headers', {}))
             self.verbEdit.setCurrentIndex(self.verbEdit.findText(options.get('verb', 'GET')))
             self.encodingEdit.setCurrentIndex(self.encodingEdit.findText(options.get('encoding', '<None>')))
-            
-            if options.get('encoding', '<None>') == 'multipart/form-data':                
-                self.multipartEdit.setParams(options.get('payload',{}))
+
+            if options.get('encoding', '<None>') == 'multipart/form-data':
+                self.multipartEdit.setParams(options.get('payload', {}))
             else:
-                self.payloadEdit.setPlainText(options.get('payload',''))
-                    
+                self.payloadEdit.setPlainText(options.get('payload', ''))
+
             self.verbChanged()
         except AttributeError:
             pass
@@ -485,15 +547,15 @@ class ApiTab(QScrollArea):
         except AttributeError:
             pass
 
-
         # Paging
         try:
             self.pagesEdit.setValue(int(options.get('pages', 1)))
         except AttributeError:
             pass
-        
+
         try:
-            self.pagingTypeEdit.setCurrentIndex(self.pagingTypeEdit.findText(options.get('paging_type', self.defaults.get('paging_type', 'key'))))
+            self.pagingTypeEdit.setCurrentIndex(
+                self.pagingTypeEdit.findText(options.get('paging_type', 'key')))
             self.pagingkeyEdit.setText(options.get('key_paging', ''))
             self.pagingstopEdit.setText(options.get('paging_stop', ''))
             self.pagingparamEdit.setText(options.get('param_paging', ''))
@@ -502,23 +564,23 @@ class ApiTab(QScrollArea):
             self.pagingChanged()
         except AttributeError:
             pass
-        
+
         # Extract options
         try:
-            self.extractEdit.setText(options.get('nodedata', ''))
-            self.objectidEdit.setText(options.get('objectid', ''))
+            self.extractEdit.setText(options.get('nodedata'))
+            self.objectidEdit.setText(options.get('objectid'))
         except AttributeError:
             pass
-                
-        #Scope
+
+        # Scope
         try:
-            self.scopeEdit.setText(options.get('scope',self.defaults.get('scope','')))
+            self.scopeEdit.setText(options.get('scope', ''))
         except AttributeError:
             pass
 
         # Proxy
         try:
-            self.proxyEdit.setText(options.get('proxy',self.defaults.get('proxy','')))
+            self.proxyEdit.setText(options.get('proxy', ''))
         except AttributeError:
             pass
 
@@ -529,17 +591,16 @@ class ApiTab(QScrollArea):
             if 'access_token_secret' in options:
                 self.tokensecretEdit.setText(options.get('access_token_secret', ''))
             if 'client_id' in options:
-                self.clientIdEdit.setText(options.get('client_id',''))
+                self.clientIdEdit.setText(options.get('client_id', ''))
             if 'client_secret' in options:
-                self.clientSecretEdit.setText(options.get('client_secret',''))
+                self.clientSecretEdit.setText(options.get('client_secret', ''))
 
         except AttributeError:
             pass
 
-
     def saveSettings(self):
         self.mainWindow.settings.beginGroup("ApiModule_" + self.name)
-        options = self.getOptions('settings')
+        options = self.getSettings('settings')
 
         for key in list(options.keys()):
             self.mainWindow.settings.setValue(key, options[key])
@@ -552,7 +613,7 @@ class ApiTab(QScrollArea):
         for key in self.mainWindow.settings.allKeys():
             options[key] = self.mainWindow.settings.value(key)
         self.mainWindow.settings.endGroup()
-        self.setOptions(options)
+        self.setSettings(options)
 
     @Slot(str)
     def logMessage(self,message):
@@ -568,47 +629,12 @@ class ApiTab(QScrollArea):
         Loads and prepares documentation
         '''
 
-        self.resourceEdit.clear()
-        self.apidoc = self.mainWindow.apiWindow.getDocModule(self.name)
+        # Add base paths
+        self.basepathEdit.clear()
+        urls = self.mainWindow.apiWindow.getApiBasePaths(self.name)
+        self.basepathEdit.insertItems(0,urls)
 
-        if self.apidoc and isinstance(self.apidoc,dict):
-            # Add base path
-            self.basepathEdit.clear()
-            self.basepathEdit.addItem(getDictValue(self.apidoc,"servers.0.url"))
-
-            # Add endpoints in reverse order
-            endpoints = self.apidoc.get("paths",{})
-            paths = endpoints.keys()
-            for path in list(paths):
-                operations = endpoints[path]
-                path = path.replace("{", "<").replace("}", ">")
-
-                self.resourceEdit.addItem(path)
-                idx = self.resourceEdit.count()-1
-                self.resourceEdit.setItemData(idx, wraptip(getDictValue(operations,"get.summary","")), Qt.ToolTipRole)
-
-                #store params for later use in onChangedRelation
-                self.resourceEdit.setItemData(idx, operations, Qt.UserRole)
-
-            self.buttonApiHelp.setVisible(True)
-
-            # Path extension for Twitter (deprecated)
-            self.defaults['extension'] = getDictValue(self.apidoc, "servers.0.x-facepager-suffix")
-
-            # Default extract settings
-            self.defaults['key_objectid'] = getDictValueOrNone(self.apidoc,"x-facepager-objectid")
-            self.defaults['key_nodedata'] = getDictValueOrNone(self.apidoc,"x-facepager-extract")
-
-            # Default pagination setting
-            pagination = getDictValueOrNone(self.apidoc, "x-facepager-pagination", dump=False)
-            self.defaults['paging_type'] = getDictValueOrNone(pagination,'method')
-            self.defaults['param_paging'] = getDictValueOrNone(pagination,'param')
-            self.defaults['key_paging'] = getDictValueOrNone(pagination,'key')
-            self.defaults['paging_stop'] = getDictValueOrNone(pagination,'stop')
-
-        self.resourceEdit.insertItem(0, "/<Object ID>")
-
-
+        # TODO: set API Docs as item data
 
     def showDoc(self):
         '''
@@ -617,6 +643,84 @@ class ApiTab(QScrollArea):
         basepath = self.basepathEdit.currentText().strip()
         path = self.resourceEdit.currentText().strip()
         self.mainWindow.apiWindow.showDoc(self.name, basepath, path)
+
+    def getDefaultAndDocOptions(self, options = {}):
+        # Set default options
+        defaults = self.defaults.copy()
+        defaults.update(self.getDocOptions())
+        defaults.update(options)
+
+        return defaults
+
+    def getDocOptions(self):
+
+        # def getFromDoc(self, dockey, defaultkey=None):
+        #     dockey = dockey.replace("<", "{").replace(">", "}")
+        #     value = getDictValue(self.apidoc, dockey, dump=False, default=None)
+        #     if (value is None) and (defaultkey is not None):
+        #         value = self.defaults.get(defaultkey)
+        #     return value
+
+        # Get general doc
+        basepath = self.basepathEdit.currentText().strip()
+        apidoc = self.mainWindow.apiWindow.getApiDoc(self.name,basepath)
+
+        # Get response doc
+        resourceidx = self.resourceEdit.findText(self.resourceEdit.currentText())
+        operations = self.resourceEdit.itemData(resourceidx,Qt.UserRole) if resourceidx != -1 else {}
+        schema = getDictValue(operations, "get.responses.200.content.application/json.schema", []) if operations else []
+
+        options = {}
+
+        # Params
+        params = getDictValue(operations, "get.parameters", False) if operations else []
+        defaultparams = {}
+        for param in params:
+            # Default values for required params
+            if param.get("required", False) or param.get("x-facepager-default", False):
+                name = param.get("name", "")
+                name = "<" + name + ">" if param.get("in", "query") == "path" else name
+                value = param.get("example", "<Object ID>")
+
+                defaultparams[name] = value
+
+        options['params'] = defaultparams
+
+        # Path extension for Twitter (deprecated)
+        options['extension'] = getDictValue(apidoc, "servers.0.x-facepager-suffix")
+
+        # Default extract settings
+        options['objectid'] = getDictValueOrNone(apidoc, "x-facepager-objectid")
+        options['nodedata'] = getDictValueOrNone(apidoc, "x-facepager-extract")
+
+        # Default pagination settings
+        pagination = getDictValueOrNone(apidoc, "x-facepager-pagination", dump=False)
+        options['paging_type'] = getDictValueOrNone(pagination, 'method')
+        options['param_paging'] = getDictValueOrNone(pagination, 'param')
+        options['key_paging'] = getDictValueOrNone(pagination, 'key')
+        options['paging_stop'] = getDictValueOrNone(pagination, 'stop')
+
+        # Default authorization settings
+        authorization = getDictValueOrNone(apidoc, "x-facepager-authorization", dump=False)
+        options['auth_type'] = getDictValueOrNone(authorization, 'auth_type')
+        options['auth_uri'] = getDictValueOrNone(authorization, 'auth_uri')
+        options['auth_tokenuri'] = getDictValueOrNone(authorization, 'token_uri')
+
+        options['auth'] = getDictValueOrNone(authorization, 'auth_method')
+        options['auth_tokenname'] = getDictValueOrNone(authorization, 'token_name')
+
+
+        # Extract options from response reference
+        if 'x-facepager-extract' in schema:
+            options['nodedata'] = schema.get('x-facepager-extract')
+
+        if 'x-facepager-objectid' in schema:
+            options['objectid'] = schema.get('x-facepager-objectid')
+
+
+        options = {k: v for k, v in options.items() if v is not None}
+
+        return options
 
     def initInputs(self):
         '''
@@ -630,6 +734,7 @@ class ApiTab(QScrollArea):
             self.basepathEdit.insertItems(0, [self.defaults.get('basepath','')])
         self.basepathEdit.setEditable(True)
         self.mainLayout.addRow("Base path", self.basepathEdit)
+        self.basepathEdit.currentIndexChanged.connect(self.onChangedBasepath)
 
         #Resource
         self.resourceLayout = QHBoxLayout()
@@ -652,7 +757,7 @@ class ApiTab(QScrollArea):
         #Parameters
         self.paramEdit = QParamEdit(self)
         self.mainLayout.addRow("Parameters", self.paramEdit)
-        self.resourceEdit.currentIndexChanged.connect(self.onChangedRelation)
+        self.resourceEdit.currentIndexChanged.connect(self.onChangedResource)
 
     def getFileFolderName(self,options, nodedata):
         # Folder
@@ -987,10 +1092,28 @@ class ApiTab(QScrollArea):
             self.extraLayout.addRow("Response", layout)
 
     @Slot()
-    def onChangedRelation(self, index = None):
+    def onChangedBasepath(self, index = None):
         '''
-        Handles the automated parameter suggestion for the current
-        selected API relation/endpoint based on the OpenAPI specification 3.0.0
+        Handles the automated resource suggestion for the
+        selected API based on the OpenAPI specification 3.0.0
+        '''
+        if index is None:
+            index = self.basepathEdit.findText(self.basepathEdit.currentText())
+            if index != -1:
+                self.basepathEdit.setCurrentIndex(index)
+
+        self.updateBasePath()
+        self.updateResource()
+
+        defaults = self.getDefaultAndDocOptions()
+        self.updateParams(defaults)
+        self.updateOptions(defaults)
+
+    @Slot()
+    def onChangedResource(self, index = None):
+        '''
+        Handles the automated parameter suggestion for the
+        selected API endpoint based on the OpenAPI specification 3.0.0
         '''
 
         if index is None:
@@ -998,9 +1121,12 @@ class ApiTab(QScrollArea):
             if index != -1:
                 self.resourceEdit.setCurrentIndex(index)
 
-        operations = self.resourceEdit.itemData(index,Qt.UserRole)
-        params = getDictValue(operations,"get.parameters",False) if operations else []
-        self.paramEdit.setOpenAPIOptions(params)
+        self.updateResource()
+
+        defaults = self.getDefaultAndDocOptions()
+        self.updateParams(defaults)
+        self.updateOptions(defaults)
+
 
     @Slot()
     def onChangedParam(self,index=0):
@@ -1011,7 +1137,7 @@ class ApiTab(QScrollArea):
             self.proxies = {}
             if hasattr(self, "proxyEdit"):
                 self.proxies = self.proxyEdit.text().strip()
-                self.proxies = self.proxies .split(";")
+                self.proxies = self.proxies.split(";")
 
         if len(self.proxies) == 0:
             proxy = ""
@@ -1275,7 +1401,8 @@ class ApiTab(QScrollArea):
 
 
                     out = content.getvalue()
-                    encoding = cchardet.detect(out)['encoding'] #encoding = 'utf-8'
+                    encoding = cchardet.detect(out)['encoding']
+                    encoding = 'utf-8' if encoding is None else encoding
                     out = out.decode(encoding)
 
                 except Exception as e:
@@ -1514,6 +1641,83 @@ class ApiTab(QScrollArea):
                 folder = dlg.selectedFiles()[0]
                 self.downloadfolderEdit.setText(folder)
 
+    def getGlobalOptions(self):
+        # Get global options
+        settings = {}
+        settings['nodelevel'] = self.mainWindow.levelEdit.value()
+        settings['excludetypes'] = self.mainWindow.typesEdit.text()
+
+        settings['threads'] = self.mainWindow.threadsEdit.value()
+        settings['speed'] = self.mainWindow.speedEdit.value()
+        settings['errors'] = self.mainWindow.errorEdit.value()
+        settings['expand'] = self.mainWindow.autoexpandCheckbox.isChecked()
+        settings['logrequests'] = self.mainWindow.logCheckbox.isChecked()
+        settings['saveheaders'] = self.mainWindow.headersCheckbox.isChecked()
+        settings['fulloffcut'] = self.mainWindow.offcutCheckbox.isChecked()
+        settings['timeout'] = self.mainWindow.timeoutEdit.value()
+        settings['maxsize'] = self.mainWindow.maxsizeEdit.value()
+        settings['allnodes'] = self.mainWindow.allnodesCheckbox.isChecked()
+        settings['resume'] = self.mainWindow.resumeCheckbox.isChecked()
+        settings['emptyonly'] = self.mainWindow.emptyCheckbox.isChecked()
+
+        return settings
+
+    def setGlobalOptions(self, settings):
+        value = settings.get('nodelevel', None)  # default None
+        if value is not None:
+            self.mainWindow.levelEdit.setValue(int(value))
+
+        value = settings.get('excludetypes', None)  # default None
+        if value is not None:
+            self.mainWindow.typesEdit.setText(str(value))
+
+        value = settings.get('threads', None)  # default None
+        if value is not None:
+            self.mainWindow.threadsEdit.setValue(int(value))
+
+        value = settings.get('speed')  # default 200
+        if value is not None:
+            self.mainWindow.speedEdit.setValue(int(value))
+
+        value = settings.get('errors', None)  # default None
+        if value is not None:
+            self.mainWindow.errorEdit.setValue(int(value))
+
+        value = settings.get('expand', None)  # default None
+        if value is not None:
+            self.mainWindow.autoexpandCheckbox.setChecked(bool(value))
+
+        value = settings.get('saveheaders', None)  # default None
+        if value is not None:
+            self.mainWindow.headersCheckbox.setChecked(bool(value))
+
+        value = settings.get('fulloffcut', None)  # default None
+        if value is not None:
+            self.mainWindow.offcutCheckbox.setChecked(bool(value))
+
+        value = settings.get('timeout')  # default 15
+        if value is not None:
+            self.mainWindow.timeoutEdit.setValue(int(value))
+
+        value = settings.get('maxsize')  # default 5
+        if value is not None:
+            self.mainWindow.maxsizeEdit.setValue(int(value))
+
+        value = settings.get('logrequests', None)  # default None
+        if value is not None:
+            self.mainWindow.logCheckbox.setChecked(bool(value))
+
+        value = settings.get('allnodes', None)  # default None
+        if value is not None:
+            self.mainWindow.allnodesCheckbox.setChecked(bool(value))
+
+        value = settings.get('resume', None)  # default None
+        if value is not None:
+            self.mainWindow.resumeCheckbox.setChecked(bool(value))
+
+        value = settings.get('emptyonly', None)  # default None
+        if value is not None:
+            self.mainWindow.emptyCheckbox.setChecked(bool(value))
 
 class AuthTab(ApiTab):
     """
@@ -1654,41 +1858,42 @@ class AuthTab(ApiTab):
         #self.mainLayout.addRow(rowcaption, loginwidget)
         self.extraLayout.addRow(rowcaption, loginlayout)
 
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(AuthTab, self).getOptions(purpose)
+    def getSettings(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(AuthTab, self).getSettings(purpose)
+        defaults = self.getDefaultAndDocOptions()
 
         # Auth type
         try:
-            options['auth_type'] = self.authTypeEdit.currentText().strip() if self.authTypeEdit.currentText() != "" else self.defaults.get('auth_type', '')
+            options['auth_type'] = self.authTypeEdit.currentText().strip() if self.authTypeEdit.currentText() != "" else defaults.get('auth_type', '')
         except AttributeError:
-            self.defaults.get('auth_type', '')
+            options['auth_type'] = defaults.get('auth_type', '')
 
         # OAUTH URIs
         try:
             options[
-                'auth_uri'] = self.authURIEdit.text().strip() if self.authURIEdit.text() != "" else self.defaults.get(
+                'auth_uri'] = self.authURIEdit.text().strip() if self.authURIEdit.text() != "" else defaults.get(
                 'auth_uri', '')
             options[
-                'redirect_uri'] = self.redirectURIEdit.text().strip() if self.redirectURIEdit.text() != "" else self.defaults.get(
+                'redirect_uri'] = self.redirectURIEdit.text().strip() if self.redirectURIEdit.text() != "" else defaults.get(
                 'redirect_uri', '')
             options[
-                'token_uri'] = self.tokenURIEdit.text().strip() if self.tokenURIEdit.text() != "" else self.defaults.get(
+                'token_uri'] = self.tokenURIEdit.text().strip() if self.tokenURIEdit.text() != "" else defaults.get(
                 'token_uri', '')
         except AttributeError:
-            options['auth_uri'] = self.defaults.get('auth_uri', '')
-            options['redirect_uri'] = self.defaults.get('redirect_uri', '')
-            options['token_uri'] = self.defaults.get('token_uri', '')
+            options['auth_uri'] = defaults.get('auth_uri', '')
+            options['redirect_uri'] = defaults.get('redirect_uri', '')
+            options['token_uri'] = defaults.get('token_uri', '')
 
         try:
             options['auth'] = self.authEdit.currentText().strip() \
                 if self.authEdit.currentText() != "" \
-                else self.defaults.get('auth', 'disable')
+                else defaults.get('auth', 'disable')
 
             options['auth_tokenname'] = self.tokenNameEdit.text()
 
         except AttributeError:
             options.pop('auth_tokenname',None)
-            options['auth'] = self.defaults.get('auth', 'disable')
+            options['auth'] = defaults.get('auth', 'disable')
 
         # Override authorization settings (token handling)
         # based on authentication settings
@@ -1716,7 +1921,14 @@ class AuthTab(ApiTab):
 
         return options
 
-    def setOptions(self, options):
+
+    # Transfer options to GUI
+    def setSettings(self, settings = {}):
+        settings = super(AuthTab, self).setSettings(settings)
+
+        # Merge options
+        options = self.getDefaultAndDocOptions(settings)
+
         # Legacy types
         if options.get('auth_type') == 'Twitter OAuth1':
             options['auth_type'] = 'OAuth1'
@@ -1733,7 +1945,7 @@ class AuthTab(ApiTab):
             options['auth_prefix'] = "Bearer "
             options['auth_tokenname'] = "Authorization"
         elif options.get('auth_type') == 'OAuth1':
-            options['auth'] = 'disable' # managed by Twitter module
+            options['auth'] = 'disable'  # managed by Twitter module
             options['auth_prefix'] = ''
             options['auth_tokenname'] = ''
         elif options.get('auth_type') == 'Cookie':
@@ -1743,8 +1955,7 @@ class AuthTab(ApiTab):
 
         try:
             self.authTypeEdit.setCurrentIndex( \
-                self.authTypeEdit.findText(options.get('auth_type', \
-                self.defaults.get('auth_type', 'Disable'))))
+                self.authTypeEdit.findText(options.get('auth_type', 'Disable')))
             self.authURIEdit.setText(options.get('auth_uri'))
             self.redirectURIEdit.setText(options.get('redirect_uri'))
             self.tokenURIEdit.setText(options.get('token_uri'))
@@ -1757,7 +1968,7 @@ class AuthTab(ApiTab):
         except AttributeError:
             pass
 
-        super(AuthTab, self).setOptions(options)
+        return options
 
     def fetchData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
         # Preconditions
@@ -1814,14 +2025,6 @@ class AuthTab(ApiTab):
             options['querystatus'] = status
             options['ratelimit'] = (status == "error (429)")
 
-            # fallback option for data handling
-            if (options.get('nodedata') is None):
-                key_nodedata = self.defaults.get('key_nodedata')
-                if (key_nodedata is not None) and  hasDictValue(data, key_nodedata):
-                    options['nodedata'] = key_nodedata
-            if (options.get('objectid') is None):
-                options['objectid'] = self.defaults.get('key_objectid')
-
             # return data
             logData(data, options, headers)
 
@@ -1853,7 +2056,7 @@ class AuthTab(ApiTab):
         :return:
         """
         self.closeSession(session_no)
-        options = self.getOptions()
+        options = self.getSettings()
 
         if options['auth_type'] == 'OAuth2 Client Credentials':
             self.doTwitterAppLogin(session_no)
@@ -1897,7 +2100,7 @@ class AuthTab(ApiTab):
     @Slot()
     def doOAuth2Login(self, session_no=0):
         try:
-            options = self.getOptions()
+            options = self.getSettings()
 
             # use credentials from input if provided
             clientid = self.getClientId()
@@ -1939,7 +2142,7 @@ class AuthTab(ApiTab):
     @Slot()
     def doOAuth2ExternalLogin(self, session_no=0):
         try:
-            options = self.getOptions()
+            options = self.getSettings()
 
             # use credentials from input if provided
             clientid = self.getClientId()
@@ -1983,7 +2186,7 @@ class AuthTab(ApiTab):
             # print("Domain: "+domain+". Cookie: "+cookie)
 
         try:
-            options = self.getOptions()
+            options = self.getSettings()
             url= options.get('auth_uri', '')
 
             if url == '':
@@ -2018,7 +2221,7 @@ class AuthTab(ApiTab):
             if clientsecret == '':
                 raise Exception('Client Secret is missing, please adjust settings!')
 
-            options = self.getOptions()
+            options = self.getSettings()
             path= options.get('auth_uri', '')
             if path == '':
                 raise Exception('Login URL is missing, please adjust settings!')
@@ -2101,7 +2304,7 @@ class AuthTab(ApiTab):
 
     @Slot()
     def onLoginWindowChanged(self, url=False):
-        options = self.getOptions()
+        options = self.getSettings()
 
         if options['auth_type'] == 'OAuth2 Client Credentials':
             return False
@@ -2112,7 +2315,7 @@ class AuthTab(ApiTab):
                 self.closeLoginWindow()
         else:
             url = url.toString()
-            options = self.getOptions()
+            options = self.getSettings()
             if url.startswith(options['redirect_uri']):
                 if self.getOAuth2Token(url):
                     self.closeLoginWindow()
@@ -2137,7 +2340,7 @@ class AuthTab(ApiTab):
             self.loginServerInstance = None
 
     def onLoginServerRedirect(self, path):
-        options = self.getOptions()
+        options = self.getSettings()
         url = options['redirect_uri'] + path
         if self.getOAuth2Token(url):
             self.stopLoginServer()
@@ -2152,7 +2355,7 @@ class AuthTab(ApiTab):
         :param no: session number
         :return: session object
         """
-        options = self.getOptions()
+        options = self.getSettings()
 
         if options.get('auth_type') == 'OAuth1':
             return self.initOAuth1Session(no, renew)
@@ -2249,7 +2452,7 @@ class AuthTab(ApiTab):
     def getOAuth2Token(self, url):
         success = False
         try:
-            options = self.getOptions()
+            options = self.getSettings()
 
             urlparsed = urlparse(url)
             query = parse_qs(urlparsed.query)
@@ -2396,8 +2599,8 @@ class GenericTab(AuthTab):
         self.loadSettings()
 
 
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(GenericTab, self).getOptions(purpose)
+    def getSettings(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(GenericTab, self).getSettings(purpose)
 
         if purpose != 'preset':
             options['querytype'] = self.name + ':'+options['basepath']+options['resource']
@@ -2420,7 +2623,7 @@ class FacebookTab(AuthTab):
         #Defaults
         self.defaults['auth_type'] = "OAuth2"
         self.defaults['scope'] = '' #user_groups
-        self.defaults['basepath'] = 'https://graph.facebook.com/v3.2'
+        self.defaults['basepath'] = 'https://graph.facebook.com/v3.4'
         self.defaults['resource'] = '/<Object ID>'
         self.defaults['auth_uri'] = 'https://www.facebook.com/dialog/oauth'
         self.defaults['redirect_uri'] = 'https://www.facebook.com/connect/login_success.html'
@@ -2454,8 +2657,8 @@ class FacebookTab(AuthTab):
         self.scopeEdit = QLineEdit()
         authlayout.addRow("Scopes",self.scopeEdit)
 
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(FacebookTab, self).getOptions(purpose)
+    def getSettings(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(FacebookTab, self).getSettings(purpose)
 
         options['auth'] = 'param'
         options['auth_prefix'] = ''
@@ -2466,11 +2669,13 @@ class FacebookTab(AuthTab):
 
         return options
 
-    def setOptions(self, options):
-        if 'pageid' in options:
-            self.pageIdEdit.setText(options.get('pageid'))
+    def setSettings(self, settings ={}):
+        settings = super(FacebookTab, self).setSettings(settings)
 
-        super(FacebookTab, self).setOptions(options)
+        if 'pageid' in settings:
+            self.pageIdEdit.setText(settings.get('pageid'))
+
+        return settings
 
     def fetchData(self, nodedata, options=None, logData=None, logMessage=None, logProgress=None):
         # Preconditions
@@ -2534,14 +2739,6 @@ class FacebookTab(AuthTab):
                     options['ratelimit'] = True
                 else:
                     options['ratelimit'] = False
-
-            # fallback option for data handling
-            if (options.get('nodedata') is None):
-                key_nodedata = self.defaults.get('key_nodedata')
-                if (key_nodedata is not None) and  hasDictValue(data, key_nodedata):
-                    options['nodedata'] = key_nodedata
-            if (options.get('objectid') is None):
-                options['objectid'] = self.defaults.get('key_objectid')
 
             logData(data, options, headers)
             if logProgress is not None:
@@ -2677,8 +2874,8 @@ class AmazonTab(AuthTab):
 
         self.extraLayout.addRow("Access Key", loginwidget)
 
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(AmazonTab, self).getOptions(purpose)
+    def getSettings(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(AmazonTab, self).getSettings(purpose)
 
         options['auth'] = 'disable'
         #options['format'] = self.defaults.get('format', '')
@@ -2692,17 +2889,19 @@ class AmazonTab(AuthTab):
 
         return options
 
-    def setOptions(self, options):
-        if 'secretkey' in options:
-            self.secretkeyEdit.setText(options.get('secretkey'))
+    def setSettings(self, settings = {}):
+        settings = super(AmazonTab, self).setSettings(settings)
 
-        if 'accesskey' in options:
-            self.accesskeyEdit.setText(options.get('accesskey'))
+        if 'secretkey' in settings:
+            self.secretkeyEdit.setText(settings.get('secretkey'))
 
-        self.serviceEdit.setText(options.get('service'))
-        self.regionEdit.setText(options.get('region'))
+        if 'accesskey' in settings:
+            self.accesskeyEdit.setText(settings.get('accesskey'))
 
-        super(AmazonTab, self).setOptions(options)
+        self.serviceEdit.setText(settings.get('service'))
+        self.regionEdit.setText(settings.get('region'))
+
+        return settings
 
 
     # Get authorization header
@@ -2888,11 +3087,14 @@ class TwitterTab(AuthTab):
         self.clientSecretEdit.setEchoMode(QLineEdit.Password)
         authlayout.addRow("Consumer Secret", self.clientSecretEdit)
 
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(TwitterTab, self).getOptions(purpose)
+    def getSettings(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(TwitterTab, self).getSettings(purpose)
 
         if options['auth_type'] == 'OAuth2 Client Credentials':
             options['auth_uri'] = 'https://api.twitter.com/oauth2/token/'
+            options['auth'] = 'header'
+            options['auth_prefix'] = 'Bearer '
+            options['auth_tokenname'] = "Authorization"
 
         return options
 
@@ -2942,14 +3144,6 @@ class TwitterTab(AuthTab):
             if 'x-rate-limit-remaining' in headers:
                 options['info'] = {'x-rate-limit-remaining': "{} requests remaining until rate limit".format(
                     headers['x-rate-limit-remaining'])}
-
-            # fallback option for data handling
-            if (options.get('nodedata') is None):
-                key_nodedata = self.defaults.get('key_nodedata')
-                if (key_nodedata is not None) and  hasDictValue(data, key_nodedata):
-                    options['nodedata'] = key_nodedata
-            if (options.get('objectid') is None):
-                options['objectid'] = self.defaults.get('key_objectid')
 
             logData(data, options, headers)
             if logProgress is not None:
@@ -3099,12 +3293,6 @@ class TwitterStreamingTab(TwitterTab):
             logpath = self.getLogURL(urlpath, urlparams, options)
             logMessage("Fetching data for {0} from {1}".format(nodedata['objectid'], logpath))
 
-        # fallback option for data handling
-        if (options.get('nodedata') is None):
-            options['nodedata'] = self.defaults.get('key_nodedata')
-        if (options.get('objectid') is None):
-            options['objectid'] = self.defaults.get('key_objectid')
-
         self.timeout = options.get('timeout',30)
         self.maxsize = options.get('maxsize', 5)
 
@@ -3183,8 +3371,8 @@ class YoutubeTab(AuthTab):
 
         return getDictValueOrNone(data,'items.0.id')
 
-    def getOptions(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
-        options = super(YoutubeTab, self).getOptions(purpose)
+    def getSettings(self, purpose='fetch'):  # purpose = 'fetch'|'settings'|'preset'
+        options = super(YoutubeTab, self).getSettings(purpose)
 
         if options.get('auth_type') == 'API key':
             options['auth'] = 'param'

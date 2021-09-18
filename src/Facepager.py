@@ -31,7 +31,7 @@ import html
 
 from PySide2.QtCore import *
 from PySide2.QtGui import *
-from PySide2.QtWidgets import QWidget, QStyleFactory
+from PySide2.QtWidgets import QWidget, QStyleFactory, QMainWindow
 
 
 from icons import *
@@ -70,7 +70,7 @@ class MainWindow(QMainWindow):
     def __init__(self,central=None):
         super(MainWindow,self).__init__()
 
-        self.setWindowTitle("Facepager 4.3")
+        self.setWindowTitle("Facepager 4.4")
         self.setWindowIcon(QIcon(":/icons/icon_facepager.png"))
         QApplication.setAttribute(Qt.AA_DisableWindowContextHelpButton)
 
@@ -78,7 +78,7 @@ class MainWindow(QMainWindow):
         # This is needed to display the app icon on the taskbar on Windows 7
         if os.name == 'nt':
             import ctypes
-            myappid = 'Facepager.4.3' # arbitrary string
+            myappid = 'Facepager.4.4' # arbitrary string
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
         self.setMinimumSize(1100,680)
@@ -418,7 +418,7 @@ class MainWindow(QMainWindow):
         #-Continue pagination
         self.resumeCheckbox = QCheckBox(self)
         self.resumeCheckbox.setCheckState(Qt.Unchecked)
-        self.resumeCheckbox.setToolTip(wraptip("Check if you want to continue collection after fetching was cancelled or nodes were skipped. The last fetched offcut or data node is used to determine the pagination value. Nodes are skipped if no pagination value can be found. Nodes without children having status fetched(200) are processed anyway."))
+        self.resumeCheckbox.setToolTip(wraptip("Check if you want to continue collection after fetching was cancelled or nodes were skipped. A selected node (you can use the option to select all nodes) will be added to the queue if: a) It is empty. b) It has no child node with query status fetched (200), object type data, offcut, or empty, and a corresponding query type. c) Such child nodes are used to determine the pagination value. Nodes for which pagination values can be determined are added to the queue."))
         fetchsettings.addRow("Resume collection", self.resumeCheckbox)
 
         # Thread Box
@@ -505,12 +505,10 @@ class MainWindow(QMainWindow):
             else:
                 webbrowser.open('file:///'+os.path.dirname(self.database.filename))
 
-
     def getModule(self,module):
         for i in range(0, self.RequestTabs.count()):
             if self.RequestTabs.widget(i).name == module:
-                tab = self.RequestTabs.widget(i)
-                return tab
+                return self.RequestTabs.widget(i)
         return None
 
     def updateUI(self):
@@ -567,7 +565,7 @@ class MainWindow(QMainWindow):
         self.settings.beginGroup("MainWindow")
         self.settings.setValue("size", self.size())
         self.settings.setValue("pos", self.pos())
-        self.settings.setValue("version","4.3")
+        self.settings.setValue("version","4.4")
         self.settings.endGroup()
 
 
@@ -575,7 +573,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue('module',self.RequestTabs.currentWidget().name)
         self.settings.setValue("lastpath", self.database.filename)
 
-        self.settings.setValue('saveheaders', self.autoexpandCheckbox.isChecked())
+        self.settings.setValue('saveheaders', self.headersCheckbox.isChecked())
         self.settings.setValue('expand', self.autoexpandCheckbox.isChecked())
         self.settings.setValue('logrequests', self.logCheckbox.isChecked())
         self.settings.setValue('style', self.styleEdit.currentText())
